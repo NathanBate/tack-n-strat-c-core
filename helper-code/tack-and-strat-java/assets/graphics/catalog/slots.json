@@ -1,0 +1,153 @@
+{
+  "tackstratGraphicsCatalog": 1,
+  "slots": [
+    {
+      "id": "unit.scout",
+      "label": "Scout unit",
+      "assetKind": "single_png",
+      "notes": "Centered PNG on hex; PNG preferred over txt sprite fallback.",
+      "imageReturnSpec": "Return exactly one RGBA PNG for this slot (import bundle: pngBase64ByRelativePath key must be \"scout.png\"). Canvas: 128–256 px square, transparent background. Anchor visual weight to bottom_center of the hex footprint; silhouette readable at ~32 px on-screen; no baked shadows or text. Optional matching txtSprite \"scout.txt\" (ASCII #/X rows) only if PNG omitted.",
+      "defaultFiles": {
+        "png": "assets/graphics/scout.png",
+        "txtSprite": "assets/graphics/scout.txt"
+      }
+    },
+    {
+      "id": "unit.settler",
+      "label": "Settler unit",
+      "assetKind": "single_png",
+      "notes": "",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"settler.png\"). Same layout rules as other units: 128–256 px, transparent, bottom_center anchor, high contrast, no labels. Optional \"settler.txt\" sprite grid if no PNG.",
+      "defaultFiles": {
+        "png": "assets/graphics/settler.png",
+        "txtSprite": "assets/graphics/settler.txt"
+      }
+    },
+    {
+      "id": "city.banner",
+      "label": "City (full hex)",
+      "assetKind": "single_png",
+      "notes": "Art is clipped to the hex; design for a pointy-top tile. Player tint is applied underneath.",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"city.png\"). Design for a pointy-top hex mask: important art inside the hex; edges may be clipped. 128–256 px class canvas, transparent outside crest; player color is drawn under this layer—leave room/treat edges for tint bleed. Optional \"city.txt\" fallback.",
+      "defaultFiles": {
+        "png": "assets/graphics/city.png",
+        "txtSprite": "assets/graphics/city.txt"
+      }
+    },
+    {
+      "id": "unit.warrior",
+      "label": "Warrior unit",
+      "assetKind": "single_png",
+      "notes": "Centered on hex like scout/settler; falls back to glyph if files missing.",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"warrior.png\"). Unit-on-hex rules: 128–256 px, transparent, bottom_center, combat-readable silhouette, no text. Optional \"warrior.txt\".",
+      "defaultFiles": {
+        "png": "assets/graphics/warrior.png",
+        "txtSprite": "assets/graphics/warrior.txt"
+      }
+    },
+    {
+      "id": "unit.farmer",
+      "label": "Farmer unit",
+      "assetKind": "single_png",
+      "notes": "",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"farmer.png\"). Same unit hex spec as scout; civilian readable iconography. Optional \"farmer.txt\".",
+      "defaultFiles": {
+        "png": "assets/graphics/farmer.png",
+        "txtSprite": "assets/graphics/farmer.txt"
+      }
+    },
+    {
+      "id": "unit.builder",
+      "label": "Builder unit",
+      "assetKind": "single_png",
+      "notes": "",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"builder.png\"). Same unit hex spec; suggest tools/gear readable at small size. Optional \"builder.txt\".",
+      "defaultFiles": {
+        "png": "assets/graphics/builder.png",
+        "txtSprite": "assets/graphics/builder.txt"
+      }
+    },
+    {
+      "id": "improvement.farm",
+      "label": "Farm improvement",
+      "assetKind": "single_png",
+      "notes": "",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"farm.png\"). Tile improvement overlay: sits on grass/terrain; ~128 px class, transparent outside structure; avoid full-hex blocking shapes unless intentional. Optional \"farm.txt\".",
+      "defaultFiles": {
+        "png": "assets/graphics/farm.png",
+        "txtSprite": "assets/graphics/farm.txt"
+      }
+    },
+    {
+      "id": "improvement.mine",
+      "label": "Mine improvement",
+      "assetKind": "single_png",
+      "notes": "Drawn on hill tiles with a mine; falls back to Mi glyph.",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"mine.png\"). Hill/mine overlay: compact, readable on muted terrain; transparent background; no text. Optional \"mine.txt\".",
+      "defaultFiles": {
+        "png": "assets/graphics/mine.png",
+        "txtSprite": "assets/graphics/mine.txt"
+      }
+    },
+    {
+      "id": "wildlife.token",
+      "label": "Wildlife (map)",
+      "assetKind": "single_png",
+      "notes": "Shared token for all animals on the map; falls back to species glyph.",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"wildlife.png\"). Small map token (~96–128 px), transparent; simple silhouette works for all species; centered. Optional \"wildlife.txt\".",
+      "defaultFiles": {
+        "png": "assets/graphics/wildlife.png",
+        "txtSprite": "assets/graphics/wildlife.txt"
+      }
+    },
+    {
+      "id": "terrain.water",
+      "label": "Terrain: Water tile",
+      "assetKind": "single_png",
+      "notes": "Full-hex terrain texture layer for water tiles.",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"terrain_water.png\"). Full-hex texture style for water; seamless look is preferred; no text."
+    },
+    {
+      "id": "terrain.grass",
+      "label": "Terrain: Grass tile",
+      "assetKind": "single_png",
+      "notes": "Full-hex terrain texture layer for grass tiles.",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"terrain_grass.png\"). Full-hex texture style for grassland; no text."
+    },
+    {
+      "id": "terrain.plains",
+      "label": "Terrain: Plains tile",
+      "assetKind": "single_png",
+      "notes": "Full-hex terrain texture layer for plains tiles.",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"terrain_plains.png\"). Full-hex texture style for plains/steppe; no text."
+    },
+    {
+      "id": "terrain.desert",
+      "label": "Terrain: Desert tile",
+      "assetKind": "single_png",
+      "notes": "Full-hex terrain texture layer for desert tiles.",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"terrain_desert.png\"). Full-hex texture style for sand/desert; no text."
+    },
+    {
+      "id": "terrain.hill",
+      "label": "Terrain: Hill tile",
+      "assetKind": "single_png",
+      "notes": "Full-hex terrain texture layer for hill tiles.",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"terrain_hill.png\"). Full-hex texture style for rolling hills; no text."
+    },
+    {
+      "id": "terrain.forest",
+      "label": "Terrain: Forest tile",
+      "assetKind": "single_png",
+      "notes": "Full-hex terrain texture layer for forest tiles.",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"terrain_forest.png\"). Full-hex texture style for forest canopy/floor; no text."
+    },
+    {
+      "id": "terrain.mountain",
+      "label": "Terrain: Mountain tile",
+      "assetKind": "single_png",
+      "notes": "Full-hex terrain texture layer for mountain tiles.",
+      "imageReturnSpec": "Return exactly one RGBA PNG (bundle key \"terrain_mountain.png\"). Full-hex texture style for mountains/rock; no text."
+    }
+  ]
+}

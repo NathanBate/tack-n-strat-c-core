@@ -1,0 +1,21 @@
+{
+  "assignments" : {
+    "unit.scout" : "upload:unit.scout_1778095752214.png",
+    "unit.settler" : "upload:unit.settler_1778078421589.png",
+    "city.banner" : "upload:city.banner_1778086537251.png",
+    "unit.warrior" : "upload:unit.warrior_1778117111273.png",
+    "unit.farmer" : "upload:unit.farmer_1778117142709.png",
+    "unit.builder" : "default",
+    "improvement.farm" : "default",
+    "improvement.mine" : "default",
+    "wildlife.token" : "default",
+    "terrain.water" : "upload:terrain.water_1778078337098.png",
+    "terrain.grass" : "upload:terrain.grass_1778078518420.png",
+    "terrain.plains" : "upload:terrain.plains_1778081408899.png",
+    "terrain.desert" : "upload:terrain.desert_1778082762023.png",
+    "terrain.hill" : "upload:terrain.hill_1778081064922.png",
+    "terrain.forest" : "upload:terrain.forest_1778079792010.png",
+    "terrain.mountain" : "default"
+  },
+  "tackstratGraphicAssignments" : 1
+}

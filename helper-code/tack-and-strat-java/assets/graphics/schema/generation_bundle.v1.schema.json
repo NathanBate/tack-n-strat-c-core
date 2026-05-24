@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tackstrat.local/schema/graphics/generation_bundle.v1",
+  "title": "TackStrat Graphics Generation Bundle v1",
+  "type": "object",
+  "required": [
+    "tackstratGraphicsGenerationBundle",
+    "proposedSetId",
+    "targetSlotId",
+    "assetKind"
+  ],
+  "properties": {
+    "tackstratGraphicsGenerationBundle": {
+      "type": "integer",
+      "const": 1
+    },
+    "proposedSetId": {
+      "type": "string",
+      "description": "Slug for assets/graphics/sets/{proposedSetId}/ directory (ASCII, no spaces recommended)."
+    },
+    "label": {
+      "type": "string"
+    },
+    "targetSlotId": {
+      "type": "string",
+      "description": "Must exist in catalog (assets/graphics/catalog/slots.json) once the slot ships in game."
+    },
+    "assetKind": {
+      "type": "string",
+      "enum": [
+        "single_png",
+        "phase_sequence",
+        "equipment_variants",
+        "tiled_texture"
+      ]
+    },
+    "canvas": {
+      "type": "object",
+      "properties": {
+        "widthPx": { "type": "integer", "minimum": 4 },
+        "heightPx": { "type": "integer", "minimum": 4 },
+        "anchor": {
+          "type": "string",
+          "enum": [
+            "center",
+            "bottom_center",
+            "top_center"
+          ]
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "transparent",
+            "opaque"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "deliverables": {
+      "type": "object",
+      "properties": {
+        "rootRelativeToRepo": { "type": "string" },
+        "manifestFilename": { "type": "string" },
+        "expectedManifestShape": {
+          "type": "string",
+          "const": "tackstratGraphicSetManifest"
+        }
+      },
+      "additionalProperties": true
+    },
+    "phasePlan": {
+      "type": "object",
+      "properties": {
+        "count": { "type": "integer", "minimum": 1 },
+        "indexOrigin": { "type": "integer" },
+        "filenamePattern": { "type": "string" },
+        "semanticLabels": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "phases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["index", "relativePath"],
+        "properties": {
+          "index": { "type": "integer" },
+          "relativePath": { "type": "string" },
+          "semantic": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": true
+}

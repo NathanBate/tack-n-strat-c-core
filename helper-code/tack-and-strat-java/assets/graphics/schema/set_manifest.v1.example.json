@@ -1,0 +1,20 @@
+{
+  "tackstratGraphicSetManifest": 1,
+  "id": "minimal_alt_art",
+  "label": "Minimal alternative art pack",
+  "author": "",
+  "slotFiles": {
+    "unit.scout": {
+      "png": "scout.png",
+      "txtSprite": "scout.txt"
+    },
+    "unit.settler": {
+      "png": "settler.png",
+      "txtSprite": "settler.txt"
+    },
+    "city.banner": {
+      "png": "city.png",
+      "txtSprite": "city.txt"
+    }
+  }
+}

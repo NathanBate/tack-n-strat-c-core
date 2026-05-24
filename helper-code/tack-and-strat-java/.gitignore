@@ -1,0 +1,7 @@
+/target/
+.idea/
+*.iml
+assets/music/envato-bundles/
+assets/music/envato-expanded/
+**/envato-bundles/
+music-api/.env

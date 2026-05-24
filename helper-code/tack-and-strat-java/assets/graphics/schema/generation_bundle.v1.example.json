@@ -1,0 +1,37 @@
+{
+  "tackstratGraphicsGenerationBundle": 1,
+  "proposedSetId": "wheat_field_growth_v1",
+  "label": "Wheat farm — 40 growth phases",
+  "targetSlotId": "improvement.farm_phases",
+  "assetKind": "phase_sequence",
+  "canvas": {
+    "widthPx": 128,
+    "heightPx": 128,
+    "anchor": "bottom_center",
+    "background": "transparent"
+  },
+  "deliverables": {
+    "rootRelativeToRepo": "assets/graphics/sets/wheat_field_growth_v1",
+    "manifestFilename": "manifest.json",
+    "expectedManifestShape": "tackstratGraphicSetManifest"
+  },
+  "phasePlan": {
+    "count": 40,
+    "indexOrigin": 0,
+    "filenamePattern": "farm_phase_{index:03d}.png",
+    "semanticLabels": [
+      "plowed soil",
+      "planted",
+      "early sprouts",
+      "mid growth",
+      "full crop"
+    ]
+  },
+  "phases": [
+    {
+      "index": 0,
+      "relativePath": "farm_phase_000.png",
+      "semantic": "plowed soil"
+    }
+  ]
+}

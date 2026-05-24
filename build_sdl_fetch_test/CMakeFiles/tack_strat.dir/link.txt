@@ -1,0 +1,1 @@
+/usr/bin/c++  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/tack_strat.dir/src/main.cpp.o -o tack_strat  libtack_strat_core.a
