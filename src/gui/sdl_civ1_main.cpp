@@ -9,6 +9,7 @@
  */
 
 #include <SDL3/SDL.h>
+#include <SDL3_ttf/SDL_ttf.h>
 
 #include <array>
 #include <algorithm>
@@ -64,6 +65,9 @@ using tack::strat::Terrain;
 using tack::strat::TileImprovement;
 using tack::strat::Unit;
 using tack::strat::UnitKind;
+using tack::strat::Weather;
+using tack::strat::WildAnimal;
+using tack::strat::WildAnimalKind;
 
 namespace {
 
@@ -92,6 +96,7 @@ constexpr float k_prod_btn_h = 28.f;
 constexpr float k_prod_btn_gap = 4.f;
 constexpr float k_inspector_btn_h = 26.f;
 constexpr float k_inspector_btn_gap = 3.f;
+constexpr float k_hud_action_orb_d = 72.f;
 constexpr std::array<UnitKind, 6> k_production_kinds = {
     UnitKind::SETTLER, UnitKind::SCOUT,     UnitKind::WARRIOR,
     UnitKind::FARMER,  UnitKind::BUILDER,  UnitKind::HUNTING_PARTY,
@@ -110,6 +115,18 @@ constexpr float k_minimap_pad = 14.f;
 constexpr float k_city_label_name_h = 10.f;
 constexpr float k_city_label_gap = 2.f;
 constexpr float k_city_plate_h = 13.f;
+constexpr float k_lod_detail_min_scale = 0.58f;
+constexpr float k_edge_pan_margin = 22.f;
+constexpr float k_edge_pan_step = 24.f;
+
+struct SettlerLensHint {
+  HexCoord hex;
+  int rank = 0;
+  int score = 0;
+  int travel_turns = 0;
+  std::vector<std::string> positives;
+  std::vector<std::string> negatives;
+};
 
 constexpr std::uint8_t kBgTopRgb[] = {10, 18, 29};          // paintMapContent gradient top
 constexpr std::uint8_t kBgBotRgb[] = {24, 42, 68};          // gradient bottom
@@ -120,8 +137,111 @@ struct RGB {
   float b{};
 };
 
+struct RGBA {
+  float r{};
+  float g{};
+  float b{};
+  float a{};
+};
+
 [[nodiscard]] constexpr RGB rgb_u8(std::uint8_t R, std::uint8_t G, std::uint8_t B) {
   return {R / 255.f, G / 255.f, B / 255.f};
+}
+
+// ---- TrueType text (SDL3_ttf) ---------------------------------------------------------------
+// All UI text routes through menu_ui::draw_text / text_width. When a font is loaded these use
+// SDL3_ttf with a per-(string,color) texture cache; otherwise they fall back to SDL's 8x8 debug
+// font so the GUI still works if no system font is found.
+TTF_Font* g_ui_font = nullptr;
+
+struct CachedTextTexture {
+  SDL_Texture* tex = nullptr;
+  int w = 0;
+  int h = 0;
+};
+std::unordered_map<std::string, CachedTextTexture> g_text_cache;
+
+[[nodiscard]] inline Uint8 to_u8(float c) {
+  return static_cast<Uint8>(std::lround(std::clamp(c, 0.f, 1.f) * 255.f));
+}
+
+SDL_Texture* acquire_text_texture(SDL_Renderer* ren, char const* text, RGB c, int* out_w,
+                                  int* out_h) {
+  if (g_ui_font == nullptr || text == nullptr || text[0] == '\0') {
+    return nullptr;
+  }
+  char prefix[8];
+  std::snprintf(prefix, sizeof(prefix), "%02x%02x%02x|", to_u8(c.r), to_u8(c.g), to_u8(c.b));
+  std::string key = std::string(prefix) + text;
+  if (auto it = g_text_cache.find(key); it != g_text_cache.end()) {
+    *out_w = it->second.w;
+    *out_h = it->second.h;
+    return it->second.tex;
+  }
+  SDL_Color const col{to_u8(c.r), to_u8(c.g), to_u8(c.b), 255};
+  SDL_Surface* surf = TTF_RenderText_Blended(g_ui_font, text, 0, col);
+  if (surf == nullptr) {
+    return nullptr;
+  }
+  SDL_Texture* tex = SDL_CreateTextureFromSurface(ren, surf);
+  int const tw = surf->w;
+  int const th = surf->h;
+  SDL_DestroySurface(surf);
+  if (tex == nullptr) {
+    return nullptr;
+  }
+  SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_LINEAR);
+  if (g_text_cache.size() > 1500) {
+    for (auto& [k, v] : g_text_cache) {
+      if (v.tex != nullptr) {
+        SDL_DestroyTexture(v.tex);
+      }
+    }
+    g_text_cache.clear();
+  }
+  g_text_cache.emplace(std::move(key), CachedTextTexture{tex, tw, th});
+  *out_w = tw;
+  *out_h = th;
+  return tex;
+}
+
+void init_ui_font() {
+  if (!TTF_Init()) {
+    return;
+  }
+  // macOS system fonts (the user selected a system-font source). First that opens wins.
+  char const* candidates[] = {
+      "/System/Library/Fonts/Supplemental/Arial.ttf",
+      "/Library/Fonts/Arial.ttf",
+      "/System/Library/Fonts/Helvetica.ttc",
+      "/System/Library/Fonts/Avenir.ttc",
+      "/System/Library/Fonts/Supplemental/Verdana.ttf",
+      "/System/Library/Fonts/Geneva.ttf",
+      "/System/Library/Fonts/SFNS.ttf",
+  };
+  for (char const* path : candidates) {
+    g_ui_font = TTF_OpenFont(path, 14.0f);
+    if (g_ui_font != nullptr) {
+      break;
+    }
+  }
+  if (g_ui_font != nullptr) {
+    TTF_SetFontHinting(g_ui_font, TTF_HINTING_LIGHT);
+  }
+}
+
+void shutdown_ui_font() {
+  for (auto& [k, v] : g_text_cache) {
+    if (v.tex != nullptr) {
+      SDL_DestroyTexture(v.tex);
+    }
+  }
+  g_text_cache.clear();
+  if (g_ui_font != nullptr) {
+    TTF_CloseFont(g_ui_font);
+    g_ui_font = nullptr;
+  }
+  TTF_Quit();
 }
 
 namespace menu_ui {
@@ -153,9 +273,14 @@ void fill_rect(SDL_Renderer* ren, SDL_FRect r, RGB c, float a = 1.f);
 void stroke_rect(SDL_Renderer* ren, SDL_FRect r, RGB c, float a = 1.f);
 void draw_modal_card(SDL_Renderer* ren, SDL_FRect r);
 [[nodiscard]] std::string truncate_line(std::string s, std::size_t max_len);
+[[nodiscard]] std::vector<std::string> wrap_text_to_width(std::string text, float max_width);
 [[nodiscard]] float text_width(char const* text) noexcept;
 void draw_text(SDL_Renderer* ren, float x, float y, char const* text, RGB c, float a = 1.f);
+void draw_text_wrapped(SDL_Renderer* ren, float x, float y, std::string const& text, float max_w,
+                       float line_h, RGB c, float a = 1.f);
 void draw_text_centered(SDL_Renderer* ren, float cx, float y, char const* text, RGB c, float a = 1.f);
+void draw_text_centered_wrapped(SDL_Renderer* ren, float cx, float y, std::string const& text,
+                                float max_w, float line_h, RGB c, float a = 1.f);
 void draw_button(SDL_Renderer* ren, SDL_FRect r, char const* label, RGB fill, RGB border, RGB text,
                  bool enabled, bool primary = false);
 
@@ -321,11 +446,113 @@ struct View {
   float world_max_x = 1.f;
   float world_min_y = 0.f;
   float world_max_y = 1.f;
+  /** When true, pan/zoom/minimap use discovered territory only (Civ-style). */
+  bool use_active_bounds = false;
+  float active_min_x = 0.f;
+  float active_max_x = 1.f;
+  float active_min_y = 0.f;
+  float active_max_y = 1.f;
 };
+
+[[nodiscard]] float map_area_height(int win_h) noexcept {
+  return std::max(100.f, static_cast<float>(win_h) - k_top_bar_h - k_footer_bar_h);
+}
+
+[[nodiscard]] float map_center_x(int win_w) noexcept {
+  return static_cast<float>(win_w) * 0.5f;
+}
+
+[[nodiscard]] float map_center_y(int win_h) noexcept {
+  return k_top_bar_h + map_area_height(win_h) * 0.5f;
+}
+
+[[nodiscard]] float view_bounds_min_x(View const& v) noexcept {
+  return v.use_active_bounds ? v.active_min_x : v.world_min_x;
+}
+[[nodiscard]] float view_bounds_max_x(View const& v) noexcept {
+  return v.use_active_bounds ? v.active_max_x : v.world_max_x;
+}
+[[nodiscard]] float view_bounds_min_y(View const& v) noexcept {
+  return v.use_active_bounds ? v.active_min_y : v.world_min_y;
+}
+[[nodiscard]] float view_bounds_max_y(View const& v) noexcept {
+  return v.use_active_bounds ? v.active_max_y : v.world_max_y;
+}
+
+void sync_view_bounds_for_player(View* v, GameSession const& session, int seat) {
+  if (v == nullptr || session.is_over()) {
+    if (v != nullptr) {
+      v->use_active_bounds = false;
+    }
+    return;
+  }
+  auto const visited = session.visited_for(seat);
+  int const total = static_cast<int>(session.map().all_cells().size());
+  if (visited.empty() || static_cast<int>(visited.size()) >= total) {
+    v->use_active_bounds = false;
+    return;
+  }
+  float const hw = std::sqrt(3.f) * HEX_R;
+  float const hh = 2.f * HEX_R;
+  float const pad = HEX_R * 1.4f;
+  float min_x = std::numeric_limits<float>::infinity();
+  float max_x = -std::numeric_limits<float>::infinity();
+  float min_y = std::numeric_limits<float>::infinity();
+  float max_y = -std::numeric_limits<float>::infinity();
+  for (HexCoord const c : visited) {
+    float const cx = axial_to_world_x(c);
+    float const cy = axial_to_world_y(c);
+    min_x = std::min(min_x, cx - hw / 2.f);
+    max_x = std::max(max_x, cx + hw / 2.f);
+    min_y = std::min(min_y, cy - hh / 2.f);
+    max_y = std::max(max_y, cy + hh / 2.f);
+  }
+  if (!std::isfinite(min_x) || !std::isfinite(min_y)) {
+    v->use_active_bounds = false;
+    return;
+  }
+  v->active_min_x = min_x - pad;
+  v->active_max_x = max_x + pad;
+  v->active_min_y = min_y - pad;
+  v->active_max_y = max_y + pad;
+  v->use_active_bounds = true;
+}
+
+[[nodiscard]] float min_allowed_scale(View const& v, int window_w, int window_h) noexcept {
+  if (!v.use_active_bounds) {
+    return MIN_SCALE;
+  }
+  float const dx = v.active_max_x - v.active_min_x;
+  float const dy = v.active_max_y - v.active_min_y;
+  if (dx <= 0.f || dy <= 0.f) {
+    return MIN_SCALE;
+  }
+  float const w = static_cast<float>(std::max(100, window_w));
+  float const map_h = map_area_height(window_h);
+  float const sx = (w - 80.f) / dx;
+  float const sy = (map_h - 80.f) / dy;
+  return std::clamp(std::min(sx, sy), MIN_SCALE, MAX_SCALE);
+}
 
 void world_to_screen(View const& v, float wx, float wy, float* sx, float* sy) {
   *sx = wx * v.scale + v.offset_x;
   *sy = wy * v.scale + v.offset_y;
+}
+
+struct MapScreen {
+  int w = 0;
+  int h = 0;
+};
+
+[[nodiscard]] bool hex_on_map_screen(View const& v, float cx, float cy,
+                                     MapScreen const& screen) noexcept {
+  float sx = 0.f;
+  float sy = 0.f;
+  world_to_screen(v, cx, cy, &sx, &sy);
+  float const margin = HEX_R * v.scale + 6.f;
+  return sx >= -margin && sx <= static_cast<float>(screen.w) + margin &&
+         sy >= k_top_bar_h - margin &&
+         sy <= static_cast<float>(screen.h) - k_footer_bar_h + margin;
 }
 
 [[nodiscard]] HexCoord pick_hex_at_screen(GameSession const& session, View const& v, float scr_x,
@@ -373,35 +600,99 @@ void recompute_world_bounds(GameSession const& session, View* v) {
 
 void clamp_view(View* v, int window_w, int window_h) {
   float const w = static_cast<float>(std::max(100, window_w));
-  float const h = static_cast<float>(std::max(100, window_h));
-  float const min_ox = w - 200.f - v->world_max_x * v->scale;
-  float const max_ox = 200.f - v->world_min_x * v->scale;
-  float const min_oy = h - 200.f - v->world_max_y * v->scale;
-  float const max_oy = 200.f - v->world_min_y * v->scale;
+  float const map_top = k_top_bar_h;
+  float const map_bot = static_cast<float>(window_h) - k_footer_bar_h;
+  float const bmin_x = view_bounds_min_x(*v);
+  float const bmax_x = view_bounds_max_x(*v);
+  float const bmin_y = view_bounds_min_y(*v);
+  float const bmax_y = view_bounds_max_y(*v);
+  float const min_ox = w - 200.f - bmax_x * v->scale;
+  float const max_ox = 200.f - bmin_x * v->scale;
+  float const min_oy = map_bot - 200.f - bmax_y * v->scale;
+  float const max_oy = map_top + 200.f - bmin_y * v->scale;
   v->offset_x = std::min(max_ox, std::max(min_ox, v->offset_x));
   v->offset_y = std::min(max_oy, std::max(min_oy, v->offset_y));
 }
 
+[[nodiscard]] bool view_shows_any_discovered(View const& v, GameSession const& session,
+                                             int seat, int win_w, int win_h) {
+  auto const visited = session.visited_for(seat);
+  if (visited.empty()) {
+    return true;
+  }
+  float const x0 = 0.f;
+  float const y0 = k_top_bar_h;
+  float const x1 = static_cast<float>(win_w);
+  float const y1 = static_cast<float>(win_h) - k_footer_bar_h;
+  for (HexCoord const c : visited) {
+    float sx = 0.f;
+    float sy = 0.f;
+    world_to_screen(v, axial_to_world_x(c), axial_to_world_y(c), &sx, &sy);
+    if (sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void maybe_edge_pan_view(View* v, float mx, float my, int win_w, int win_h) {
+  float dx = 0.f;
+  float dy = 0.f;
+  if (mx <= k_edge_pan_margin) {
+    dx = k_edge_pan_step;
+  } else if (mx >= static_cast<float>(win_w) - k_edge_pan_margin) {
+    dx = -k_edge_pan_step;
+  }
+  float const map_top = k_top_bar_h + k_edge_pan_margin;
+  float const map_bot = static_cast<float>(win_h) - k_footer_bar_h - k_edge_pan_margin;
+  if (my <= map_top) {
+    dy = k_edge_pan_step;
+  } else if (my >= map_bot) {
+    dy = -k_edge_pan_step;
+  }
+  if (dx != 0.f || dy != 0.f) {
+    v->offset_x += dx;
+    v->offset_y += dy;
+    clamp_view(v, win_w, win_h);
+  }
+}
+
+void enforce_view_discovered_constraints(View* v, GameSession const& session, int seat, int win_w,
+                                         int win_h) {
+  sync_view_bounds_for_player(v, session, seat);
+  float const min_s = min_allowed_scale(*v, win_w, win_h);
+  if (v->scale < min_s) {
+    v->scale = min_s;
+  }
+  clamp_view(v, win_w, win_h);
+}
+
 void fit_map_to_window(View* v, int window_w, int window_h) {
   float const w = static_cast<float>(std::max(100, window_w));
-  float const h = static_cast<float>(std::max(100, window_h));
-  float const dx = v->world_max_x - v->world_min_x;
-  float const dy = v->world_max_y - v->world_min_y;
+  float const map_h = map_area_height(window_h);
+  float const bmin_x = view_bounds_min_x(*v);
+  float const bmax_x = view_bounds_max_x(*v);
+  float const bmin_y = view_bounds_min_y(*v);
+  float const bmax_y = view_bounds_max_y(*v);
+  float const dx = bmax_x - bmin_x;
+  float const dy = bmax_y - bmin_y;
   if (!(dx > 0 && dy > 0)) {
     return;
   }
   float const sx = (w - 80.f) / dx;
-  float const sy = (h - 80.f) / dy;
-  v->scale = std::max(MIN_SCALE, std::min(MAX_SCALE, std::min(sx, sy)));
-  float const cx = (v->world_min_x + v->world_max_x) * 0.5f;
-  float const cy = (v->world_min_y + v->world_max_y) * 0.5f;
-  v->offset_x = w * 0.5f - cx * v->scale;
-  v->offset_y = h * 0.5f - cy * v->scale;
+  float const sy = (map_h - 80.f) / dy;
+  float const min_s = min_allowed_scale(*v, window_w, window_h);
+  v->scale = std::max(min_s, std::min(MAX_SCALE, std::min(sx, sy)));
+  float const cx = (bmin_x + bmax_x) * 0.5f;
+  float const cy = (bmin_y + bmax_y) * 0.5f;
+  v->offset_x = map_center_x(window_w) - cx * v->scale;
+  v->offset_y = map_center_y(window_h) - cy * v->scale;
   clamp_view(v, window_w, window_h);
 }
 
 void zoom_at(View* v, float factor, float anchor_sx, float anchor_sy, int window_w, int window_h) {
-  float const new_scale = std::max(MIN_SCALE, std::min(MAX_SCALE, v->scale * factor));
+  float const min_s = min_allowed_scale(*v, window_w, window_h);
+  float const new_scale = std::max(min_s, std::min(MAX_SCALE, v->scale * factor));
   if (new_scale == v->scale) {
     return;
   }
@@ -499,6 +790,157 @@ void stroke_hex_screen(SDL_Renderer* ren, View const& v, float cx, float cy, flo
   }
 }
 
+void stroke_hex_edge(SDL_Renderer* ren, View const& v, float cx, float cy, int edge_idx, float r,
+                     float g, float b, float a) {
+  int const i0 = ((edge_idx % 6) + 6) % 6;
+  int const i1 = (i0 + 1) % 6;
+  float wx0 = 0;
+  float wy0 = 0;
+  float wx1 = 0;
+  float wy1 = 0;
+  hex_corner_world(cx, cy, i0, &wx0, &wy0);
+  hex_corner_world(cx, cy, i1, &wx1, &wy1);
+  float sx0 = 0;
+  float sy0 = 0;
+  float sx1 = 0;
+  float sy1 = 0;
+  world_to_screen(v, wx0, wy0, &sx0, &sy0);
+  world_to_screen(v, wx1, wy1, &sx1, &sy1);
+  SDL_SetRenderDrawColorFloat(ren, r, g, b, a);
+  SDL_RenderLine(ren, sx0, sy0, sx1, sy1);
+}
+
+[[nodiscard]] HexCoord neighbor_for_edge(HexCoord c, int edge_idx) {
+  static int const dqdr[6][2] = {{0, -1}, {1, -1}, {1, 0}, {0, 1}, {-1, 1}, {-1, 0}};
+  int const i = ((edge_idx % 6) + 6) % 6;
+  return HexCoord{c.q + dqdr[i][0], c.r + dqdr[i][1]};
+}
+
+[[nodiscard]] int edge_index_toward(HexCoord from, HexCoord to) noexcept {
+  for (int i = 0; i < 6; ++i) {
+    if (neighbor_for_edge(from, i) == to) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+void fill_hex_edge_inward_quad(SDL_Renderer* ren, View const& v, float cx, float cy, int edge_idx,
+                               float er, float eg, float eb, float ea, float ir, float ig,
+                               float ib, float ia, float inset_len) {
+  int const i0 = ((edge_idx % 6) + 6) % 6;
+  int const i1 = (i0 + 1) % 6;
+  float wx0 = 0.f;
+  float wy0 = 0.f;
+  float wx1 = 0.f;
+  float wy1 = 0.f;
+  hex_corner_world(cx, cy, i0, &wx0, &wy0);
+  hex_corner_world(cx, cy, i1, &wx1, &wy1);
+  float const mx = (wx0 + wx1) * 0.5f;
+  float const my = (wy0 + wy1) * 0.5f;
+  float vx = cx - mx;
+  float vy = cy - my;
+  float const vl = std::hypot(vx, vy);
+  if (vl < 1e-4f) {
+    return;
+  }
+  float const scale = inset_len / vl;
+  vx *= scale;
+  vy *= scale;
+  float const ix0 = wx0 + vx;
+  float const iy0 = wy0 + vy;
+  float const ix1 = wx1 + vx;
+  float const iy1 = wy1 + vy;
+  float sx0 = 0.f;
+  float sy0 = 0.f;
+  float sx1 = 0.f;
+  float sy1 = 0.f;
+  float sx2 = 0.f;
+  float sy2 = 0.f;
+  float sx3 = 0.f;
+  float sy3 = 0.f;
+  world_to_screen(v, wx0, wy0, &sx0, &sy0);
+  world_to_screen(v, wx1, wy1, &sx1, &sy1);
+  world_to_screen(v, ix1, iy1, &sx2, &sy2);
+  world_to_screen(v, ix0, iy0, &sx3, &sy3);
+  SDL_Vertex vtx[4]{};
+  vtx[0].position = {sx0, sy0};
+  vtx[0].color = {er, eg, eb, ea};
+  vtx[0].tex_coord = {0, 0};
+  vtx[1].position = {sx1, sy1};
+  vtx[1].color = {er, eg, eb, ea};
+  vtx[1].tex_coord = {0, 0};
+  vtx[2].position = {sx2, sy2};
+  vtx[2].color = {ir, ig, ib, ia};
+  vtx[2].tex_coord = {0, 0};
+  vtx[3].position = {sx3, sy3};
+  vtx[3].color = {ir, ig, ib, ia};
+  vtx[3].tex_coord = {0, 0};
+  int ind[6] = {0, 1, 2, 0, 2, 3};
+  SDL_RenderGeometry(ren, nullptr, vtx, 4, ind, 6);
+}
+
+[[nodiscard]] RGBA weather_wash_rgba(Weather w, bool in_sight) noexcept {
+  float const a = (in_sight ? 52.f : 34.f) / 255.f;
+  switch (w) {
+    case Weather::CLEAR:
+      return {1.f, 1.f, 1.f, 0.f};
+    case Weather::RAIN:
+      return {70.f / 255.f, 145.f / 255.f, 255.f / 255.f, a};
+    case Weather::DROUGHT:
+      return {215.f / 255.f, 165.f / 255.f, 85.f / 255.f, a};
+    case Weather::STORM:
+      return {125.f / 255.f, 95.f / 255.f, 205.f / 255.f, std::min(1.f, a + 10.f / 255.f)};
+    case Weather::COLD_SNAP:
+      return {205.f / 255.f, 232.f / 255.f, 255.f / 255.f, a};
+    case Weather::HEAT_WAVE:
+      return {255.f / 255.f, 115.f / 255.f, 55.f / 255.f, a};
+    case Weather::FOG:
+      return {188.f / 255.f, 190.f / 255.f, 198.f / 255.f, std::min(1.f, a + 8.f / 255.f)};
+  }
+  return {1.f, 1.f, 1.f, 0.f};
+}
+
+[[nodiscard]] char weather_badge_char(Weather w) noexcept {
+  switch (w) {
+    case Weather::CLEAR:
+      return ' ';
+    case Weather::RAIN:
+      return 'R';
+    case Weather::DROUGHT:
+      return 'd';
+    case Weather::STORM:
+      return 'T';
+    case Weather::COLD_SNAP:
+      return 'C';
+    case Weather::HEAT_WAVE:
+      return 'H';
+    case Weather::FOG:
+      return 'F';
+  }
+  return ' ';
+}
+
+[[nodiscard]] RGB weather_badge_ink(Weather w) noexcept {
+  switch (w) {
+    case Weather::RAIN:
+      return rgb_u8(215, 238, 255);
+    case Weather::DROUGHT:
+      return rgb_u8(255, 235, 190);
+    case Weather::STORM:
+      return rgb_u8(235, 225, 255);
+    case Weather::COLD_SNAP:
+      return rgb_u8(225, 242, 255);
+    case Weather::HEAT_WAVE:
+      return rgb_u8(255, 245, 230);
+    case Weather::FOG:
+      return rgb_u8(235, 236, 242);
+    case Weather::CLEAR:
+      return rgb_u8(255, 255, 255);
+  }
+  return rgb_u8(255, 255, 255);
+}
+
 void fill_hex_overlay(SDL_Renderer* ren, View const& v, float cx, float cy, float lr, float lg,
                       float lb, float la, float dr, float dg, float db, float da) {
   float lit_x = cx + LIGHT_DIR_X * HEX_R * 0.55f;
@@ -541,7 +983,7 @@ void fill_hex_overlay(SDL_Renderer* ren, View const& v, float cx, float cy, floa
 
 /** Horizontal bar: outer black rim, dark fill, colored HP portion (green→red). */
 void draw_unit_hp_bar(SDL_Renderer* ren, float sx_center, float sy_top, float width, float height,
-                      float hp_frac) {
+                      float hp_frac, float pulse = 0.f) {
   float const x = sx_center - width * 0.5f;
   SDL_FRect border{x - 1.f, sy_top - 1.f, width + 2.f, height + 2.f};
   SDL_SetRenderDrawColorFloat(ren, 0.f, 0.f, 0.f, 1.f);
@@ -558,6 +1000,261 @@ void draw_unit_hp_bar(SDL_Renderer* ren, float sx_center, float sy_top, float wi
     SDL_SetRenderDrawColorFloat(ren, er, eg, eb, 1.f);
     SDL_RenderFillRect(ren, &fill);
   }
+  if (pulse > 0.f && f < 1.f) {
+    float const pa = std::min(1.f, (95.f + 55.f * pulse) / 255.f);
+    SDL_SetRenderDrawColorFloat(ren, 1.f, 120.f / 255.f, 100.f / 255.f, pa);
+    SDL_RenderRect(ren, &border);
+  }
+}
+
+void draw_ground_ellipse_shadow(SDL_Renderer* ren, View const& v, float cx, float cy, float rx,
+                                float ry, float alpha) {
+  float sx = 0.f;
+  float sy = 0.f;
+  world_to_screen(v, cx + HEX_R * 0.11f, cy + HEX_R * 0.13f, &sx, &sy);
+  float const srx = rx * v.scale;
+  float const sry = ry * v.scale;
+  int const segments = 16;
+  SDL_SetRenderDrawColorFloat(ren, 0.f, 0.f, 0.f, alpha);
+  for (int i = 0; i < segments; ++i) {
+    float const a0 = 6.2831853f * static_cast<float>(i) / static_cast<float>(segments);
+    float const a1 = 6.2831853f * static_cast<float>(i + 1) / static_cast<float>(segments);
+    SDL_RenderLine(ren, sx + std::cos(a0) * srx, sy + std::sin(a0) * sry,
+                   sx + std::cos(a1) * srx, sy + std::sin(a1) * sry);
+  }
+  SDL_Vertex center{};
+  center.position = {sx, sy};
+  center.color = {0.f, 0.f, 0.f, alpha * 0.55f};
+  center.tex_coord = {0, 0};
+  for (int i = 0; i < segments; ++i) {
+    float const a0 = 6.2831853f * static_cast<float>(i) / static_cast<float>(segments);
+    float const a1 = 6.2831853f * static_cast<float>(i + 1) / static_cast<float>(segments);
+    SDL_Vertex vtx[3]{center,
+                      {{sx + std::cos(a0) * srx, sy + std::sin(a0) * sry},
+                       {0.f, 0.f, 0.f, alpha * 0.55f},
+                       {0, 0}},
+                      {{sx + std::cos(a1) * srx, sy + std::sin(a1) * sry},
+                       {0.f, 0.f, 0.f, alpha * 0.55f},
+                       {0, 0}}};
+    int ind[3] = {0, 1, 2};
+    SDL_RenderGeometry(ren, nullptr, vtx, 3, ind, 3);
+  }
+}
+
+[[nodiscard]] int city_population_tier(int population) noexcept {
+  if (population >= 9) {
+    return 3;
+  }
+  if (population >= 5) {
+    return 2;
+  }
+  return 1;
+}
+
+[[nodiscard]] char wild_animal_glyph(WildAnimalKind k) noexcept {
+  switch (k) {
+    case WildAnimalKind::WOLF:
+      return 'w';
+    case WildAnimalKind::BEAR:
+      return 'B';
+    case WildAnimalKind::BOAR:
+      return 'b';
+    case WildAnimalKind::COUGAR:
+      return 'c';
+    case WildAnimalKind::JACKAL:
+      return 'j';
+    case WildAnimalKind::ELK:
+      return 'E';
+    case WildAnimalKind::DEER:
+      return 'd';
+    case WildAnimalKind::HORSE:
+      return 'h';
+  }
+  return '?';
+}
+
+[[nodiscard]] RGB wild_animal_tint(WildAnimalKind k) noexcept {
+  switch (k) {
+    case WildAnimalKind::WOLF:
+      return rgb_u8(120, 128, 148);
+    case WildAnimalKind::BEAR:
+      return rgb_u8(92, 68, 48);
+    case WildAnimalKind::BOAR:
+      return rgb_u8(148, 98, 72);
+    case WildAnimalKind::COUGAR:
+      return rgb_u8(168, 118, 78);
+    case WildAnimalKind::JACKAL:
+      return rgb_u8(158, 138, 88);
+    case WildAnimalKind::ELK:
+      return rgb_u8(132, 108, 78);
+    case WildAnimalKind::DEER:
+      return rgb_u8(178, 138, 98);
+    case WildAnimalKind::HORSE:
+      return rgb_u8(188, 152, 108);
+  }
+  return rgb_u8(160, 120, 90);
+}
+
+void draw_terrain_tile_deco(SDL_Renderer* ren, View const& v, Terrain t, HexCoord c, float cx,
+                            float cy, bool has_city) {
+  if (v.scale < k_lod_detail_min_scale || has_city) {
+    return;
+  }
+  float const drift_x = 0.f;
+  float const drift_y = 0.f;
+  auto draw_tree = [&](float ox, float oy) {
+    float sx = 0.f;
+    float sy = 0.f;
+    world_to_screen(v, cx + ox + drift_x * 0.4f, cy + oy + drift_y * 0.4f, &sx, &sy);
+    float const h = std::max(7.f, 10.f * v.scale);
+    SDL_SetRenderDrawColorFloat(ren, 0.28f, 0.48f, 0.18f, 0.90f);
+    SDL_FRect trunk{sx - 1.5f, sy, 3.f, h * 0.38f};
+    SDL_RenderFillRect(ren, &trunk);
+    SDL_SetRenderDrawColorFloat(ren, 0.16f, 0.52f, 0.22f, 0.92f);
+    SDL_FRect crown{sx - h * 0.30f, sy - h * 0.58f, h * 0.60f, h * 0.58f};
+    SDL_RenderFillRect(ren, &crown);
+  };
+  if (t == Terrain::FOREST) {
+    draw_tree(-HEX_R * 0.32f, HEX_R * 0.14f);
+    draw_tree(HEX_R * 0.10f, -HEX_R * 0.18f);
+    draw_tree(HEX_R * 0.30f, HEX_R * 0.22f);
+  } else if (t == Terrain::HILL) {
+    auto draw_hill_arc = [&](float ox, float oy, float rad) {
+      float sx = 0.f;
+      float sy = 0.f;
+      world_to_screen(v, cx + ox, cy + oy, &sx, &sy);
+      float const sr = rad * v.scale;
+      SDL_SetRenderDrawColorFloat(ren, 0.42f, 0.31f, 0.19f, 0.82f);
+      for (int i = 0; i < 8; ++i) {
+        float const a0 = 0.35f + static_cast<float>(i) * 0.18f;
+        float const a1 = a0 + 0.18f;
+        SDL_RenderLine(ren, sx + std::cos(a0) * sr, sy + std::sin(a0) * sr * 0.55f,
+                       sx + std::cos(a1) * sr, sy + std::sin(a1) * sr * 0.55f);
+      }
+    };
+    draw_hill_arc(-HEX_R * 0.08f + drift_x * 0.2f, -HEX_R * 0.05f, HEX_R * 0.45f);
+    draw_hill_arc(HEX_R * 0.12f, -HEX_R * 0.22f, HEX_R * 0.35f);
+  } else if (t == Terrain::MOUNTAIN) {
+    float sx = 0.f;
+    float sy = 0.f;
+    world_to_screen(v, cx, cy, &sx, &sy);
+    float const base = std::max(10.f, 16.f * v.scale);
+    SDL_Vertex peak[3]{};
+    peak[0].position = {sx, sy - base * 0.95f};
+    peak[0].color = {0.72f, 0.74f, 0.78f, 0.95f};
+    peak[0].tex_coord = {0, 0};
+    peak[1].position = {sx - base, sy + base * 0.45f};
+    peak[1].color = {0.28f, 0.28f, 0.30f, 0.95f};
+    peak[1].tex_coord = {0, 0};
+    peak[2].position = {sx + base, sy + base * 0.45f};
+    peak[2].color = {0.34f, 0.34f, 0.36f, 0.95f};
+    peak[2].tex_coord = {0, 0};
+    int ind[3] = {0, 1, 2};
+    SDL_RenderGeometry(ren, nullptr, peak, 3, ind, 3);
+    SDL_SetRenderDrawColorFloat(ren, 0.92f, 0.94f, 0.98f, 0.88f);
+    SDL_FRect snow{sx - base * 0.22f, sy - base * 0.82f, base * 0.44f, base * 0.28f};
+    SDL_RenderFillRect(ren, &snow);
+  } else if (t == Terrain::PLAINS || t == Terrain::GRASS) {
+    auto draw_tuft = [&](float ox, float oy) {
+      float sx = 0.f;
+      float sy = 0.f;
+      world_to_screen(v, cx + ox + drift_x * 0.25f, cy + oy + drift_y * 0.25f, &sx, &sy);
+      float const h = std::max(4.f, 6.f * v.scale);
+      SDL_SetRenderDrawColorFloat(ren, 0.52f, 0.68f, 0.28f, 0.78f);
+      SDL_FRect tuft{sx - h * 0.5f, sy - h, h, h};
+      SDL_RenderFillRect(ren, &tuft);
+    };
+    draw_tuft(-HEX_R * 0.22f, HEX_R * 0.08f);
+    draw_tuft(HEX_R * 0.18f, -HEX_R * 0.12f);
+    draw_tuft(HEX_R * 0.05f, HEX_R * 0.20f);
+  } else if (t == Terrain::DESERT) {
+    auto draw_dune = [&](float ox, float oy, float rad) {
+      float sx = 0.f;
+      float sy = 0.f;
+      world_to_screen(v, cx + ox, cy + oy, &sx, &sy);
+      float const sr = rad * v.scale;
+      SDL_SetRenderDrawColorFloat(ren, 0.78f, 0.66f, 0.38f, 0.55f);
+      for (int i = 0; i < 7; ++i) {
+        float const a0 = 3.4f + static_cast<float>(i) * 0.16f;
+        float const a1 = a0 + 0.16f;
+        SDL_RenderLine(ren, sx + std::cos(a0) * sr, sy + std::sin(a0) * sr * 0.45f,
+                       sx + std::cos(a1) * sr, sy + std::sin(a1) * sr * 0.45f);
+      }
+    };
+    draw_dune(-HEX_R * 0.12f + drift_x * 0.15f, HEX_R * 0.05f, HEX_R * 0.38f);
+    draw_dune(HEX_R * 0.20f, -HEX_R * 0.10f, HEX_R * 0.28f);
+  }
+}
+
+[[nodiscard]] bool tile_should_show_yield_badge(
+    HexCoord c, std::optional<HexCoord> hovered_hex,
+    std::optional<HexCoord> selected_unit_hex) noexcept {
+  return (hovered_hex.has_value() && *hovered_hex == c) ||
+         (selected_unit_hex.has_value() && *selected_unit_hex == c);
+}
+
+void draw_tile_yield_badge(SDL_Renderer* ren, View const& v, GameSession const& session,
+                           HexCoord c, float cx, float cy) {
+  if (v.scale < 1.0f || session.city_at(c).has_value()) {
+    return;
+  }
+  int const food = session.tile_food_yield(c);
+  int const prod = session.tile_production_yield(c);
+  int const gold = session.tile_gold_yield(c);
+  if (food == 0 && prod == 0 && gold == 0) {
+    return;
+  }
+  std::string label;
+  if (food > 0) {
+    label += "+" + std::to_string(food) + "f";
+  }
+  if (prod > 0) {
+    label += "+" + std::to_string(prod) + "p";
+  }
+  if (gold > 0) {
+    label += "+" + std::to_string(gold) + "g";
+  }
+  float sx = 0.f;
+  float sy = 0.f;
+  world_to_screen(v, cx - HEX_R * 0.42f, cy + HEX_R * 0.48f, &sx, &sy);
+  float const tw = menu_ui::text_width(label.c_str()) + 6.f;
+  SDL_FRect bg{sx - 3.f, sy - 2.f, tw, 12.f};
+  menu_ui::fill_rect(ren, bg, rgb_u8(10, 14, 20), 0.72f);
+  menu_ui::draw_text(ren, sx, sy, label.c_str(), menu_ui::k_hint, 0.95f);
+}
+
+void draw_wild_animal_marker(SDL_Renderer* ren, View const& v, WildAnimal const& beast,
+                             bool hunt_target) {
+  float const cx = axial_to_world_x(beast.coord());
+  float const cy = axial_to_world_y(beast.coord());
+  if (v.scale >= k_lod_detail_min_scale) {
+    draw_ground_ellipse_shadow(ren, v, cx, cy, HEX_R * 0.36f, HEX_R * 0.13f, 0.20f);
+  }
+  float sx = 0.f;
+  float sy = 0.f;
+  world_to_screen(v, cx, cy, &sx, &sy);
+  float const r = std::max(8.f, 11.f * v.scale);
+  RGB tint = wild_animal_tint(beast.kind());
+  SDL_SetRenderDrawColorFloat(ren, tint.r * 0.55f, tint.g * 0.55f, tint.b * 0.55f, 0.95f);
+  SDL_FRect rim{sx - r - 2.f, sy - r - 1.5f, 2.f * r + 4.f, 2.f * r + 3.f};
+  SDL_RenderFillRect(ren, &rim);
+  SDL_SetRenderDrawColorFloat(ren, tint.r, tint.g, tint.b, 0.92f);
+  SDL_FRect disk{sx - r, sy - r, 2.f * r, 2.f * r};
+  SDL_RenderFillRect(ren, &disk);
+  char label[2] = {wild_animal_glyph(beast.kind()), '\0'};
+  float const glyph_w = menu_ui::text_width(label);
+  menu_ui::draw_text(ren, sx - glyph_w * 0.5f + 1.f, sy - 6.f + 1.f, label, menu_ui::k_ink, 0.82f);
+  menu_ui::draw_text(ren, sx - glyph_w * 0.5f, sy - 6.f, label, rgb_u8(252, 250, 240), 0.94f);
+  int const max_hp = std::max(1, tack::strat::wild_max_hp(beast.kind()));
+  if (beast.hp() < max_hp) {
+    float const hp_frac = static_cast<float>(beast.hp()) / static_cast<float>(max_hp);
+    draw_unit_hp_bar(ren, sx, sy + r + 4.f, 2.f * r + 4.f, 4.f, hp_frac);
+  }
+  if (hunt_target) {
+    SDL_SetRenderDrawColorFloat(ren, 1.f, 0.72f, 0.18f, 0.80f);
+    SDL_FRect hunt_ring{sx - r - 5.f, sy - r - 5.f, 2.f * r + 10.f, 2.f * r + 10.f};
+    SDL_RenderRect(ren, &hunt_ring);
+  }
 }
 
 /** Civ I-style population plate: tan fill, black border, centered digits. */
@@ -570,9 +1267,35 @@ void draw_city_population_plate(SDL_Renderer* ren, float sx_center, float sy_top
   SDL_RenderFillRect(ren, &plate);
   SDL_SetRenderDrawColorFloat(ren, 0.f, 0.f, 0.f, 1.f);
   SDL_RenderRect(ren, &plate);
-  float const tx = sx_center - 4.f * static_cast<float>(pop_str.size());
-  SDL_SetRenderDrawColorFloat(ren, 0.f, 0.f, 0.f, 1.f);
-  SDL_RenderDebugText(ren, tx, sy_top + 3.f, pop_str.c_str());
+  float const tw = menu_ui::text_width(pop_str.c_str());
+  menu_ui::draw_text(ren, sx_center - tw * 0.5f, sy_top + 1.f, pop_str.c_str(), menu_ui::k_ink);
+}
+
+void draw_city_map_banner(SDL_Renderer* ren, float hcx, float name_ty, float name_half_w,
+                          std::string const& banner, int population, int pop_tier,
+                          bool show_build, char build_glyph) {
+  float const extra = (pop_tier >= 2 ? 16.f : 0.f) + (show_build ? 18.f : 0.f);
+  float const banner_w = name_half_w * 2.f + extra + 24.f;
+  float const banner_h = k_city_label_name_h + k_city_label_gap + k_city_plate_h + 10.f;
+  SDL_FRect card{hcx - banner_w * 0.5f, name_ty - 5.f, banner_w, banner_h};
+  menu_ui::fill_rect(ren, {card.x + 2.f, card.y + 3.f, card.w, card.h}, menu_ui::k_ink, 0.28f);
+  menu_ui::fill_rect(ren, card, rgb_u8(18, 22, 30), 0.93f);
+  menu_ui::stroke_rect(ren, card, menu_ui::k_modal_line, 0.78f);
+  float const name_w = menu_ui::text_width(banner.c_str());
+  menu_ui::draw_text(ren, hcx - name_w * 0.5f, name_ty, banner.c_str(), menu_ui::k_title, 0.96f);
+  if (pop_tier >= 3) {
+    menu_ui::draw_text(ren, hcx + name_half_w + 4.f, name_ty, "*", menu_ui::k_victory_gold, 0.97f);
+  } else if (pop_tier >= 2) {
+    menu_ui::draw_text(ren, hcx + name_half_w + 4.f, name_ty, "+", menu_ui::k_hint, 0.84f);
+  }
+  if (show_build) {
+    SDL_FRect build_bg{hcx + name_half_w + 14.f, name_ty - 1.f, 14.f, 14.f};
+    menu_ui::fill_rect(ren, build_bg, rgb_u8(28, 34, 44), 0.95f);
+    char build_label[2] = {build_glyph, '\0'};
+    menu_ui::draw_text(ren, build_bg.x + 3.f, build_bg.y + 1.f, build_label, menu_ui::k_ok);
+  }
+  float const plate_ty = name_ty + k_city_label_name_h + k_city_label_gap;
+  draw_city_population_plate(ren, hcx, plate_ty, population);
 }
 
 [[nodiscard]] char const* unit_kind_glyph(UnitKind k) noexcept {
@@ -591,6 +1314,10 @@ void draw_city_population_plate(SDL_Renderer* ren, float sx_center, float sy_top
       return "H";
   }
   return "?";
+}
+
+void draw_unit_kind_glyph_badge(SDL_Renderer* ren, float sx, float sy, UnitKind kind, float alpha) {
+  menu_ui::draw_text_centered(ren, sx, sy + 2.f, unit_kind_glyph(kind), menu_ui::k_title, alpha);
 }
 
 [[nodiscard]] char const* season_label(Season s) noexcept {
@@ -752,7 +1479,12 @@ void pick_default_human_unit(GameSession const& session, std::optional<int>* out
 [[nodiscard]] bool sdl_player_has_city_without_production(GameSession const& session);
 [[nodiscard]] bool sdl_has_pending_manual_unit_orders(GameSession const& session,
                                                       GuiState const& gui);
+void select_first_city_missing_production_sdl(GameSession const& session, View* view,
+                                              std::optional<int>* selected_unit_id,
+                                              std::optional<int>* selected_city_id, int win_w,
+                                              int win_h);
 [[nodiscard]] bool city_name_less_ci(std::string const& a, std::string const& b);
+[[nodiscard]] bool civilian_kind(UnitKind k);
 void try_found_city_sdl(GameSession& session, std::optional<int>* selected_unit_id,
                         std::optional<int>* selected_city_id, View* view, int win_w, int win_h,
                         GuiState* gui);
@@ -760,7 +1492,9 @@ void do_end_turn_sdl(GameSession& session, GuiState* gui, View* view,
                      std::optional<int>* selected_unit_id, std::optional<int>* selected_city_id,
                      int win_w, int win_h, SdlSessionFlow const* flow);
 void cycle_next_unit(GameSession& session, std::optional<int>* selected_unit_id, View* v, int win_w,
-                     int win_h, GuiState* gui);
+                     int win_h, GuiState* gui, std::optional<int>* selected_city_id = nullptr);
+void cycle_prev_unit(GameSession& session, std::optional<int>* selected_unit_id, View* v, int win_w,
+                     int win_h, GuiState* gui, std::optional<int>* selected_city_id = nullptr);
 void on_skip_action(GameSession& session, GuiState* gui, std::optional<int>* selected_unit_id,
                     std::optional<int>* selected_city_id, View* view, int win_w, int win_h,
                     SdlSessionFlow const* flow);
@@ -775,15 +1509,17 @@ void on_skip_action(GameSession& session, GuiState* gui, std::optional<int>* sel
     GameSession const& session, std::optional<int> selected_unit_id,
     std::optional<int> selected_city_id, int win_h, float max_panel_bottom_y);
 [[nodiscard]] EventLogLayout compute_event_log_layout(GuiState const& gui, int win_w, int win_h);
-void maybe_auto_advance_unit_sdl(GameSession& session, GuiState* gui, View* v,
-                                 std::optional<int>* sel_unit, int win_w, int win_h);
+void maybe_auto_advance_action_queue_sdl(GameSession& session, GuiState* gui, View* v,
+                                         std::optional<int>* sel_unit,
+                                         std::optional<int>* sel_city, int win_w, int win_h);
 void toggle_auto_focus_next_unit(GuiState* gui);
 void load_gui_options(GuiState* gui);
 void save_gui_options(GuiState const& gui);
 void dismiss_intro_tips(GuiState* gui);
 struct GameMenuLayout;
 [[nodiscard]] GameMenuLayout compute_game_menu_layout(int win_w) noexcept;
-void draw_game_menu_ui(SDL_Renderer* ren, GuiState const& gui, int win_w);
+void draw_game_menu_ui(SDL_Renderer* ren, GuiState const& gui, GameSession const& session,
+                       int win_w);
 bool try_handle_game_menu_click(GameSession& session, GuiState* gui, View* view,
                                 std::optional<int>* sel_unit, std::optional<int>* sel_city,
                                 GameMenuLayout const& layout, float mx, float my, int win_w,
@@ -803,19 +1539,32 @@ bool try_handle_production_needs_click(GameSession& session, GuiState* gui, View
                                        ProductionNeedsLayout const& layout, float mx, float my,
                                        int win_w, int win_h);
 
+enum class HudActionKind : uint8_t {
+  Wait,
+  EndTurn,
+  NextUnit,
+  Move,
+  FollowRoute,
+  FoundCity,
+  Wake,
+  Production,
+  CommitMove,
+};
+
 struct PrimaryActionState {
+  HudActionKind kind = HudActionKind::Wait;
   std::string label = "Select unit";
   std::string detail = "Click a unit/city, or press N for next unit";
   bool enabled = false;
+  bool end_turn_ready = false;
 };
 
 struct BottomActionBarLayout {
   bool visible = false;
-  SDL_FRect primary_btn{};
-  SDL_FRect end_turn_btn{};
-  PrimaryActionState primary{};
-  std::string end_turn_label = "End turn (Enter)";
-  bool end_turn_enabled = false;
+  SDL_FRect action_orb{};
+  SDL_FRect action_hit{};
+  PrimaryActionState action{};
+  int pending_unit_count = 0;
 };
 
 [[nodiscard]] PrimaryActionState compute_primary_action_state(
@@ -824,7 +1573,17 @@ struct BottomActionBarLayout {
 [[nodiscard]] BottomActionBarLayout compute_bottom_action_bar_layout(
     GameSession const& session, GuiState const& gui, std::optional<int> selected_unit_id,
     std::optional<int> selected_city_id, int win_w, int win_h);
-void draw_bottom_action_bar(SDL_Renderer* ren, BottomActionBarLayout const& layout);
+void draw_bottom_action_bar(SDL_Renderer* ren, BottomActionBarLayout const& layout,
+                            bool hovered = false);
+void clear_move_command_mode(GuiState* gui);
+void advance_hud_action_queue(GameSession& session, GuiState* gui, View* view,
+                                std::optional<int>* sel_unit, std::optional<int>* sel_city,
+                                int win_w, int win_h);
+void on_hud_action_click(GameSession& session, GuiState* gui, View* view,
+                         std::optional<int>* sel_unit, std::optional<int>* sel_city,
+                         PrimaryActionState const& action, std::optional<HexCoord> hovered_hex,
+                         int win_w, int win_h, SdlSessionFlow const* flow);
+[[nodiscard]] int count_units_needing_manual_orders(GameSession const& session, GuiState const& gui);
 void on_primary_action_sdl(GameSession& session, GuiState* gui, View* view,
                            std::optional<int>* sel_unit, std::optional<int>* sel_city,
                            std::optional<HexCoord> hovered_hex, int win_w, int win_h,
@@ -836,14 +1595,28 @@ bool try_handle_bottom_action_bar_click(GameSession& session, GuiState* gui, Vie
                                         SdlSessionFlow const* flow);
 void draw_hotkeys_overlay(SDL_Renderer* ren, int win_w, int win_h, float* out_below_y);
 bool commit_move_command(GameSession& session, GuiState* gui, std::optional<int>* selected_unit_id,
-                         std::optional<HexCoord> dest, View* view, int win_w, int win_h);
-[[nodiscard]] std::string sdl_turn_stats_hud_line(GameSession const& session);
+                         std::optional<int>* selected_city_id, std::optional<HexCoord> dest,
+                         View* view, int win_w, int win_h);
+[[nodiscard]] std::string sdl_turn_stats_hud_line(GameSession const& session, GuiState const& gui);
+[[nodiscard]] std::size_t path_last_index_reachable_this_turn(
+    Unit const& unit, std::vector<HexCoord> const& path, GameSession const& session);
 void append_event_log(GuiState* gui, std::string line);
+void trigger_combat_flash(GuiState* gui, HexCoord h);
+void present_action_feedback(GuiState* gui, std::string msg, Uint64 toast_ms = 4800,
+                             std::optional<HexCoord> combat_flash = std::nullopt);
+void toggle_weather_legend(GuiState* gui);
+void toggle_claim_legend(GuiState* gui);
+void toggle_minimap_own_claims(GuiState* gui);
+[[nodiscard]] std::optional<std::vector<HexCoord>> projected_path_to(GameSession const& session,
+                                                                     Unit const& unit,
+                                                                     HexCoord dest);
+[[nodiscard]] int projected_path_turns(Unit const& unit, std::vector<HexCoord> const& path,
+                                       GameSession const& session);
 void ensure_event_log_seeded(GameSession const& session, GuiState* gui);
 [[nodiscard]] float play_ui_max_panel_bottom(int win_h, GuiState const* gui) noexcept;
 void draw_event_log_panel(SDL_Renderer* ren, EventLogLayout const& layout, GuiState const& gui);
 
-void draw_top_hud(SDL_Renderer* ren, GameSession const& session, int win_w) {
+void draw_top_hud(SDL_Renderer* ren, GameSession const& session, GuiState const* gui, int win_w) {
   float const h = k_top_bar_h;
   SDL_SetRenderDrawColorFloat(ren, 0.055f, 0.09f, 0.14f, 0.96f);
   SDL_FRect bar{0.f, 0.f, static_cast<float>(win_w), h};
@@ -900,51 +1673,43 @@ void draw_top_hud(SDL_Renderer* ren, GameSession const& session, int win_w) {
     }
   }
 
-  std::string const right =
-      "Gold " + std::to_string(session.gold_for(session.current_player().seat));
-
-  SDL_SetRenderDrawColorFloat(ren, 0.93f, 0.95f, 1.f, 1.f);
-  SDL_RenderDebugText(ren, 12.f, 10.f, left.c_str());
-  float const mid_x = std::max(160.f, static_cast<float>(win_w) * 0.5f - 100.f);
-  SDL_RenderDebugText(ren, mid_x, 10.f, mid.c_str());
+  std::string right = "Gold " + std::to_string(session.gold_for(session.current_player().seat));
   if (!session.is_over()) {
-    std::string const yields = "+" + std::to_string(empire_food) + " food  +" +
-                               std::to_string(empire_prod) + " prod  +" +
-                               std::to_string(empire_gold) + " gold/turn";
-    float const yield_x = std::max(mid_x + 320.f, static_cast<float>(win_w) - 360.f);
-    SDL_SetRenderDrawColorFloat(ren, 0.78f, 0.84f, 0.92f, 1.f);
-    SDL_RenderDebugText(ren, yield_x, 10.f, yields.c_str());
-    SDL_SetRenderDrawColorFloat(ren, 0.93f, 0.95f, 1.f, 1.f);
+    right += "  +" + std::to_string(empire_food) + "f +" + std::to_string(empire_prod) + "p +" +
+             std::to_string(empire_gold) + "g";
   }
-  SDL_RenderDebugText(ren, static_cast<float>(win_w) - 148.f, 10.f, right.c_str());
 
-  SDL_SetRenderDrawColorFloat(ren, 0.78f, 0.82f, 0.9f, 1.f);
+  menu_ui::draw_text(ren, 12.f, 10.f, left.c_str(), menu_ui::k_title);
+  float const mid_x = std::max(160.f, static_cast<float>(win_w) * 0.5f - 140.f);
+  float const right_w = menu_ui::text_width(right.c_str());
+  float const right_start = static_cast<float>(win_w) - right_w - 56.f;
+  float const mid_max_w = right_start - mid_x - 16.f;
+  if (mid_max_w > 72.f) {
+    int const mid_cols = std::max(24, static_cast<int>(mid_max_w / 7.f));
+    mid = menu_ui::truncate_line(std::move(mid), mid_cols);
+  }
+  menu_ui::draw_text(ren, mid_x, 10.f, mid.c_str(), menu_ui::k_accent);
+  menu_ui::draw_text(ren, right_start, 10.f, right.c_str(), menu_ui::k_hint);
+
   std::string era = std::string(season_label(session.season())) + " | ";
   era += session.calendar_era_label();
   if (!session.current_player().computer && !session.is_over() &&
       session.current_player_has_auto_explore_blocked_with_moves()) {
     era += "  [explore blocked]";
   }
-  if (era.size() > 56) {
-    era.resize(53);
-    era += "...";
-  }
-  SDL_RenderDebugText(ren, 12.f, 34.f, era.c_str());
-  if (!session.is_over() && !session.current_player().computer) {
-    std::string const stats = sdl_turn_stats_hud_line(session);
+  era = menu_ui::truncate_line(std::move(era), 58);
+  menu_ui::draw_text(ren, 12.f, 34.f, era.c_str(), menu_ui::k_muted);
+  if (gui != nullptr && !session.is_over() && !session.current_player().computer) {
+    std::string const stats = sdl_turn_stats_hud_line(session, *gui);
     if (!stats.empty()) {
       float const stats_x = std::max(240.f, static_cast<float>(win_w) * 0.34f);
       menu_ui::draw_text(ren, stats_x, 34.f, stats.c_str(), menu_ui::k_hint);
     }
   }
   std::string wx = session.weather_hud_summary();
-  int const wx_budget = std::max(28, static_cast<int>(static_cast<float>(win_w) / 9.f));
-  if (static_cast<int>(wx.size()) > wx_budget) {
-    wx.resize(static_cast<std::size_t>(wx_budget - 3));
-    wx += "...";
-  }
+  wx = menu_ui::truncate_line(std::move(wx), std::max(28, static_cast<int>(win_w / 9)));
   float const wx_x = std::max(200.f, static_cast<float>(win_w) * 0.48f);
-  SDL_RenderDebugText(ren, wx_x, 34.f, wx.c_str());
+  menu_ui::draw_text(ren, wx_x, 34.f, wx.c_str(), menu_ui::k_muted, 0.92f);
 }
 
 void draw_inspector_panel_bg(SDL_Renderer* ren, SDL_FRect panel) {
@@ -1070,6 +1835,61 @@ void draw_inspector_action_btn(SDL_Renderer* ren, SDL_FRect r, char const* label
   place_row(layout.explore_btn, layout.sleep_btn);
   place_row(layout.skip_btn, layout.fortify_btn);
   layout.content_max_y = layout.skip_btn.y - 20.f;
+
+  float btn_bottom = panel_y;
+  auto track_btn = [&](SDL_FRect const& r) { btn_bottom = std::max(btn_bottom, r.y + r.h); };
+  track_btn(layout.skip_btn);
+  track_btn(layout.fortify_btn);
+  track_btn(layout.explore_btn);
+  track_btn(layout.sleep_btn);
+  if (layout.show_found_city) {
+    track_btn(layout.found_city_btn);
+  }
+  if (layout.show_cultivate) {
+    track_btn(layout.cultivate_btn);
+    track_btn(layout.clear_forest_btn);
+    track_btn(layout.build_farm_btn);
+  }
+  if (layout.show_build_mine) {
+    track_btn(layout.build_mine_btn);
+  }
+  if (layout.show_rebase) {
+    track_btn(layout.rebase_btn);
+  }
+  if (layout.show_hunt) {
+    track_btn(layout.hunt_btn);
+  }
+  float const used_bottom = btn_bottom + 12.f;
+  float const max_h = std::max(120.f, max_panel_bottom_y - panel_y);
+  layout.panel.h = std::clamp(used_bottom - panel_y, 120.f, max_h);
+  float const panel_max_y = layout.panel.y + layout.panel.h;
+  if (used_bottom > panel_max_y) {
+    float const shift = used_bottom - panel_max_y;
+    auto shift_btn = [&](SDL_FRect& btn) { btn.y -= shift; };
+    shift_btn(layout.skip_btn);
+    shift_btn(layout.fortify_btn);
+    shift_btn(layout.explore_btn);
+    shift_btn(layout.sleep_btn);
+    if (layout.show_found_city) {
+      shift_btn(layout.found_city_btn);
+    }
+    if (layout.show_cultivate) {
+      shift_btn(layout.cultivate_btn);
+      shift_btn(layout.clear_forest_btn);
+      shift_btn(layout.build_farm_btn);
+    }
+    if (layout.show_build_mine) {
+      shift_btn(layout.build_mine_btn);
+    }
+    if (layout.show_rebase) {
+      shift_btn(layout.rebase_btn);
+    }
+    if (layout.show_hunt) {
+      shift_btn(layout.hunt_btn);
+    }
+  }
+  layout.content_max_y =
+      std::min(layout.skip_btn.y - 20.f, layout.panel.y + layout.panel.h - 36.f);
   static_cast<void>(y);
   static_cast<void>(win_h);
   return layout;
@@ -1129,6 +1949,14 @@ void draw_unit_inspector(SDL_Renderer* ren, GameSession const& session,
     if (route.size() != 1) {
       rq += "es";
     }
+    if (u->moves_remaining() > 0) {
+      std::size_t const reach = path_last_index_reachable_this_turn(*u, route, session);
+      if (reach > 0) {
+        rq += " (" + std::to_string(reach) + " this turn)";
+      }
+    } else {
+      rq += " (continues next turn)";
+    }
     if (!inspector_draw_text(ren, tx, &ty, max_y, rq.c_str(), menu_ui::k_hint, 15.f)) {
       return;
     }
@@ -1160,7 +1988,7 @@ void draw_unit_inspector(SDL_Renderer* ren, GameSession const& session,
   }
 
   if (layout.is_mine) {
-    float const actions_y = layout.skip_btn.y - 14.f;
+    float const actions_y = layout.explore_btn.y - 14.f;
     if (actions_y > layout.panel.y + 10.f) {
       menu_ui::draw_text(ren, tx, actions_y, "Actions", menu_ui::k_accent);
     }
@@ -1244,7 +2072,28 @@ void draw_unit_inspector(SDL_Renderer* ren, GameSession const& session,
                                                                     k_inspector_btn_h};
     y -= k_inspector_btn_gap;
   }
-  layout.content_max_y = layout.focus_buttons[0].y - 20.f;
+  float btn_bottom = panel_y;
+  for (SDL_FRect const& btn : layout.focus_buttons) {
+    btn_bottom = std::max(btn_bottom, btn.y + btn.h);
+  }
+  for (SDL_FRect const& btn : layout.building_buttons) {
+    btn_bottom = std::max(btn_bottom, btn.y + btn.h);
+  }
+  float const used_bottom = btn_bottom + 12.f;
+  float const max_h = std::max(180.f, max_panel_bottom_y - panel_y);
+  layout.panel.h = std::clamp(used_bottom - panel_y, 180.f, max_h);
+  float const panel_max_y = layout.panel.y + layout.panel.h;
+  if (used_bottom > panel_max_y) {
+    float const shift = used_bottom - panel_max_y;
+    for (SDL_FRect& btn : layout.focus_buttons) {
+      btn.y -= shift;
+    }
+    for (SDL_FRect& btn : layout.building_buttons) {
+      btn.y -= shift;
+    }
+  }
+  layout.content_max_y =
+      std::min(layout.focus_buttons[0].y - 20.f, layout.panel.y + layout.panel.h - 36.f);
   static_cast<void>(win_h);
   return layout;
 }
@@ -1293,16 +2142,18 @@ void draw_city_inspector(SDL_Renderer* ren, GameSession const& session,
   }
 
   line = "Production: ";
+  RGB prod_color = menu_ui::k_title;
   if (auto kb = c->current_build()) {
     line += tack::strat::unit_kind_display_name(*kb);
     line += " (" + std::to_string(c->production_stored()) + "/" +
             std::to_string(std::max(1, tack::strat::unit_production_cost(*kb))) + ")";
-  } else if (layout.is_mine && show_production_drawer) {
+  } else if (layout.is_mine) {
     line += "(choose in Build panel)";
+    prod_color = rgb_u8(255, 160, 60);
   } else {
     line += "(none)";
   }
-  if (!inspector_draw_text(ren, tx, &ty, max_y, line.c_str(), menu_ui::k_title)) {
+  if (!inspector_draw_text(ren, tx, &ty, max_y, line.c_str(), prod_color)) {
     return;
   }
 
@@ -1466,7 +2317,9 @@ void draw_production_needs_panel(SDL_Renderer* ren, GameSession const& session,
   }
   draw_inspector_panel_bg(ren, layout.panel);
   float const tx = layout.panel.x + 12.f;
-  menu_ui::draw_text(ren, tx, layout.panel.y + 10.f, "Cities need production", menu_ui::k_accent);
+  std::string const header =
+      "Cities need production (" + std::to_string(layout.jump_buttons.size()) + ")";
+  menu_ui::draw_text(ren, tx, layout.panel.y + 10.f, header.c_str(), menu_ui::k_accent);
   int const seat = session.current_player().seat;
   for (std::size_t i = 0; i < layout.jump_buttons.size(); ++i) {
     auto c = session.city_by_id(layout.city_ids[i]);
@@ -1525,6 +2378,13 @@ void draw_production_drawer(SDL_Renderer* ren, GameSession const& session, City 
       text = menu_ui::k_disabled;
     }
     menu_ui::draw_button(ren, btn, label.c_str(), fill, border, text, enabled, active);
+    if (active && can_build) {
+      float const frac = static_cast<float>(c.production_stored()) /
+                         static_cast<float>(std::max(1, cost));
+      SDL_FRect prog{btn.x + 2.f, btn.y + btn.h - 4.f, (btn.w - 4.f) * std::clamp(frac, 0.f, 1.f),
+                     3.f};
+      menu_ui::fill_rect(ren, prog, menu_ui::k_ok, 0.85f);
+    }
   }
 }
 
@@ -1540,20 +2400,26 @@ void draw_footer_bar(SDL_Renderer* ren, int win_w, int win_h) {
 void draw_hotkeys_overlay(SDL_Renderer* ren, int win_w, int win_h, float* out_below_y) {
   static char const* const hotkey_lines[] = {
       "F1 / Shift+? - toggle this overlay",
-      "Enter - end turn (blocked if units need orders or city lacks production)",
-      "Primary action button - context action for selection (move, found, wake, route)",
-      "Space - skip unit / cycle / end turn",
+      "Enter / P - trigger the action button (move, next unit, production, or end turn)",
+      "Action button (circle, bottom-right) - context changes with selection and turn state",
+      "Space - skip selected unit (cycles to next when auto-cycle is on)",
       "Esc - cancel move mode / deselect",
       "Arrows - pan map (move mode: nudge destination)",
       "Trackpad - vertical zoom, horizontal pan; mouse wheel zoom",
       "+ / - - keyboard zoom    Shift+F - fit map    F11 - fullscreen",
       "Tab / N / . - next unit    Shift+Tab / , - previous",
+      "Double-click map tile to center camera",
       "Home - center on selection    Backspace - clear queued route",
-      "M - move mode    B - found city    F - fortify    Z - sleep    P - primary action",
+      "Shift+click map - queue multi-turn route without moving this turn",
+      "M - move mode (cursor at screen edge pans map)    B - found city    F - fortify    Z - sleep    P - primary action",
       "U - toggle auto unit cycling (cycles when a unit runs out of moves)",
+      "H - toggle settler recommendation lens (ranked city sites)",
+      "W - toggle weather tint key (map overlay legend)",
+      "L - toggle territory borders legend",
       "Shift+E - toggle auto-explore    1-6 - city production when city selected",
       "Ctrl/Cmd+Q - quit    Ctrl/Cmd+S - save    Ctrl/Cmd+O - load",
       "Esc - clear selection, then game menu    Menu button (top-right) - same menu",
+      "Right-click - clear selection / cancel move mode",
       "Hot seat: handoff screen after end turn before next human",
   };
   float const panel_w = std::min(560.f, static_cast<float>(win_w) - 24.f);
@@ -1639,6 +2505,7 @@ struct GuiState {
   std::unordered_set<int> skipped_units;
   std::string toast_text;
   Uint64 toast_until_ticks{};
+  bool toast_is_warning = false;
   bool show_hotkeys{};
   bool request_save{};
   bool request_load{};
@@ -1649,13 +2516,106 @@ struct GuiState {
   bool event_log_seeded = false;
   bool event_log_expanded = false;
   int event_log_scroll_offset = 0;
-  bool auto_focus_next_unit = false;
+  bool auto_focus_next_unit = true;
+  bool auto_advance_in_progress = false;
   bool tips_dismissed = false;
   bool show_intro_tips = false;
   bool show_game_menu = false;
   bool request_main_menu = false;
   int last_wildlife_arrival_round_logged = -1;
+  bool show_settler_lens = true;
+  bool show_weather_legend = true;
+  bool show_claim_legend = true;
+  bool minimap_tint_own_claims_only = false;
+  int settler_lens_unit_id = -1;
+  int settler_lens_seat = -1;
+  std::vector<SettlerLensHint> settler_lens_hints;
+  std::optional<HexCoord> combat_flash_hex;
+  Uint64 combat_flash_start_ticks = 0;
+  Uint64 combat_flash_until_ticks = 0;
+  Uint64 last_map_click_ticks = 0;
+  std::optional<HexCoord> last_map_click_hex;
+  HexCoord settler_lens_origin{0, 0};
 };
+
+void draw_move_command_overlay(SDL_Renderer* ren, GuiState const& gui, View const& v,
+                               GameSession const& session, std::optional<int> selected_unit_id,
+                               std::optional<HexCoord> hovered_hex, int win_w, int win_h) {
+  if (!gui.move_command_mode || !selected_unit_id.has_value()) {
+    return;
+  }
+  float const y0 = k_top_bar_h;
+  float const map_h = static_cast<float>(win_h) - k_top_bar_h - k_footer_bar_h;
+  SDL_FRect frame{4.f, y0 + 4.f, static_cast<float>(win_w) - 8.f, map_h - 8.f};
+  // Border only — a full-viewport translucent fill looked like screen flicker when the camera panned.
+  menu_ui::stroke_rect(ren, frame, rgb_u8(70, 210, 255), 0.72f);
+  SDL_FRect inner{frame.x + 2.f, frame.y + 2.f, frame.w - 4.f, frame.h - 4.f};
+  menu_ui::stroke_rect(ren, inner, rgb_u8(35, 140, 185), 0.38f);
+
+  auto su = session.unit_by_id(*selected_unit_id);
+  if (!su.has_value()) {
+    return;
+  }
+  std::optional<HexCoord> dest = gui.move_cursor;
+  if (!dest.has_value()) {
+    dest = hovered_hex;
+  }
+  if (!dest.has_value() || *dest == su->coord()) {
+    return;
+  }
+  float const cx = axial_to_world_x(*dest);
+  float const cy = axial_to_world_y(*dest);
+  float sx = 0.f;
+  float sy = 0.f;
+  world_to_screen(v, cx, cy, &sx, &sy);
+  float const pin = std::max(10.f, 14.f * v.scale);
+  SDL_SetRenderDrawColorFloat(ren, 1.f, 0.86f, 0.18f, 0.95f);
+  SDL_FRect head{sx - pin * 0.5f, sy - pin * 1.1f, pin, pin};
+  SDL_RenderFillRect(ren, &head);
+  SDL_SetRenderDrawColorFloat(ren, 0.12f, 0.08f, 0.02f, 0.9f);
+  SDL_RenderRect(ren, &head);
+  SDL_SetRenderDrawColorFloat(ren, 1.f, 0.86f, 0.18f, 0.95f);
+  SDL_FRect stem{sx - pin * 0.18f, sy - pin * 0.15f, pin * 0.36f, pin * 0.95f};
+  SDL_RenderFillRect(ren, &stem);
+}
+
+void draw_play_status_chips(SDL_Renderer* ren, GuiState const& gui, GameSession const& session,
+                            std::optional<int> selected_unit_id, int win_w) {
+  if (session.is_over() || session.current_player().computer) {
+    return;
+  }
+  float const x_chip_right = static_cast<float>(win_w) - 52.f - 8.f;
+  float x = x_chip_right;
+  auto chip = [&](char const* text, RGB color) {
+    float const w = menu_ui::text_width(text) + 14.f;
+    x -= w;
+    if (x < 220.f) {
+      return;
+    }
+    SDL_FRect r{x, 14.f, w, 18.f};
+    menu_ui::fill_rect(ren, r, color, 0.22f);
+    menu_ui::stroke_rect(ren, r, color, 0.72f);
+    menu_ui::draw_text(ren, x + 7.f, 17.f, text, color);
+    x -= 6.f;
+  };
+  if (!gui.skipped_units.empty()) {
+    chip(("Skipped " + std::to_string(gui.skipped_units.size())).c_str(), menu_ui::k_muted);
+  }
+  if (gui.move_command_mode) {
+    chip("Move mode", rgb_u8(70, 210, 255));
+  }
+  int const pending_orders = count_units_needing_manual_orders(session, gui);
+  if (pending_orders > 0) {
+    chip(("Orders " + std::to_string(pending_orders)).c_str(), rgb_u8(255, 140, 38));
+  }
+  if (gui.show_settler_lens && selected_unit_id.has_value()) {
+    if (auto su = session.unit_by_id(*selected_unit_id);
+        su.has_value() && su->kind() == UnitKind::SETTLER &&
+        su->owner_seat() == session.current_player().seat) {
+      chip("Settler lens", menu_ui::k_victory_gold);
+    }
+  }
+}
 
 enum class AppPhase { SetupMenu, HandoffGate, Playing, Victory };
 
@@ -1743,9 +2703,46 @@ void after_session_end_turn(GameSession& session, AppPhase* phase, bool* autosav
   }
 }
 
-void set_toast(GuiState* gui, std::string msg, Uint64 ms = 3200) {
+[[nodiscard]] bool sdl_action_message_is_failure(std::string const& msg) noexcept {
+  std::string m;
+  m.reserve(msg.size());
+  for (unsigned char ch : msg) {
+    m.push_back(static_cast<char>(std::tolower(ch)));
+  }
+  return m.find("no moves") != std::string::npos || m.find("cannot") != std::string::npos ||
+         m.find("already") != std::string::npos || m.find("only ") != std::string::npos ||
+         m.find("need ") != std::string::npos || m.find("too far") != std::string::npos ||
+         m.find("no longer") != std::string::npos || m.find("invalid") != std::string::npos ||
+         m.find("blocked") != std::string::npos || m.find("failed") != std::string::npos;
+}
+
+[[nodiscard]] bool sdl_action_message_is_success(std::string const& msg) noexcept {
+  if (sdl_action_message_is_failure(msg)) {
+    return false;
+  }
+  std::string m;
+  m.reserve(msg.size());
+  for (unsigned char ch : msg) {
+    m.push_back(static_cast<char>(std::tolower(ch)));
+  }
+  return m.find("founded") != std::string::npos || m.find("eliminated") != std::string::npos ||
+         m.find("building ") != std::string::npos || m.find("queued ") != std::string::npos ||
+         m.find("fortified") != std::string::npos || m.find("move queued") != std::string::npos ||
+         m.find("following route") != std::string::npos || m.find("hunts for") != std::string::npos ||
+         m.find("saved ") != std::string::npos || m.find("loaded ") != std::string::npos ||
+         m.find("centered on") != std::string::npos || m.find("cleared") != std::string::npos ||
+         m.find("unskipped") != std::string::npos || m.find("skipped for") != std::string::npos ||
+         m.find(" awake") != std::string::npos || m.find("woken") != std::string::npos ||
+         m.find("cycling: on") != std::string::npos || m.find("lens: on") != std::string::npos ||
+         m.find("tint key: on") != std::string::npos || m.find("borders legend: on") != std::string::npos ||
+         m.find("own-claims tint: on") != std::string::npos ||
+         m.find("fitted to discovered") != std::string::npos;
+}
+
+void set_toast(GuiState* gui, std::string msg, Uint64 ms = 3200, bool warning = false) {
   gui->toast_text = std::move(msg);
   gui->toast_until_ticks = SDL_GetTicks() + ms;
+  gui->toast_is_warning = warning;
 }
 
 void append_event_log(GuiState* gui, std::string line) {
@@ -1757,6 +2754,19 @@ void append_event_log(GuiState* gui, std::string line) {
     gui->event_log.pop_front();
   }
   gui->event_log_scroll_offset = 0;
+}
+
+void present_action_feedback(GuiState* gui, std::string msg, Uint64 toast_ms,
+                             std::optional<HexCoord> combat_flash) {
+  if (gui == nullptr || msg.empty()) {
+    return;
+  }
+  append_event_log(gui, msg);
+  bool const warning = sdl_action_message_is_failure(msg);
+  set_toast(gui, std::move(msg), toast_ms, warning);
+  if (combat_flash.has_value()) {
+    trigger_combat_flash(gui, *combat_flash);
+  }
 }
 
 void ensure_event_log_seeded(GameSession const& session, GuiState* gui) {
@@ -1821,7 +2831,7 @@ void ensure_event_log_seeded(GameSession const& session, GuiState* gui) {
   return summary;
 }
 
-[[nodiscard]] std::string sdl_turn_stats_hud_line(GameSession const& session) {
+[[nodiscard]] std::string sdl_turn_stats_hud_line(GameSession const& session, GuiState const& gui) {
   if (session.is_over() || session.current_player().computer) {
     return {};
   }
@@ -1839,7 +2849,11 @@ void ensure_event_log_seeded(GameSession const& session, GuiState* gui) {
       ++routed_units;
     }
   }
+  int const pending = count_units_needing_manual_orders(session, gui);
   std::string line = std::to_string(ready_units) + " ready";
+  if (pending > 0) {
+    line += ", " + std::to_string(pending) + " need orders";
+  }
   if (routed_units > 0) {
     line += ", " + std::to_string(routed_units) + " routed";
   }
@@ -1854,6 +2868,9 @@ void ensure_event_log_seeded(GameSession const& session, GuiState* gui) {
               std::to_string(tack::strat::unit_production_cost(*kb)) + ")";
       break;
     }
+  }
+  if (sdl_player_has_city_without_production(session)) {
+    line += " · production needed";
   }
   return line;
 }
@@ -1892,9 +2909,20 @@ void draw_event_log_panel(SDL_Renderer* ren, EventLogLayout const& layout, GuiSt
     if (ty + k_event_log_line_h > layout.panel.y + layout.panel.h - 4.f) {
       break;
     }
-    std::string line = menu_ui::truncate_line(gui.event_log[i], layout.expanded ? 72 : 58);
-    menu_ui::draw_text(ren, layout.panel.x + 10.f, ty, line.c_str(), menu_ui::k_hint);
-    ty += k_event_log_line_h;
+    std::string line = gui.event_log[i];
+    float const wrap_w = std::max(120.f, layout.panel.w - 20.f);
+    auto const wrapped = menu_ui::wrap_text_to_width(line, wrap_w);
+    for (std::size_t wi = 0; wi < wrapped.size(); ++wi) {
+      if (ty + k_event_log_line_h > layout.panel.y + layout.panel.h - 4.f) {
+        break;
+      }
+      bool const warn = wi == 0 && sdl_action_message_is_failure(gui.event_log[i]);
+      bool const ok = wi == 0 && !warn && sdl_action_message_is_success(gui.event_log[i]);
+      RGB ink = warn ? menu_ui::k_err : ok ? menu_ui::k_ok : menu_ui::k_hint;
+      menu_ui::draw_text(ren, layout.panel.x + 10.f, ty, wrapped[wi].c_str(), ink,
+                         warn ? 0.92f : 1.f);
+      ty += k_event_log_line_h;
+    }
   }
   if (layout.expanded && max_scroll > 0) {
     std::string scroll_hint = "Older +" + std::to_string(scroll) + "/" + std::to_string(max_scroll);
@@ -1911,7 +2939,7 @@ void draw_event_log_panel(SDL_Renderer* ren, EventLogLayout const& layout, GuiSt
   layout.visible = true;
   layout.expanded = gui.event_log_expanded;
   float const foot_y = static_cast<float>(win_h) - k_footer_bar_h;
-  float const panel_w = std::min(k_event_log_w, static_cast<float>(win_w) - 480.f);
+  float const panel_w = std::min(k_event_log_w, k_city_panel_w + 20.f);
   if (panel_w < 180.f) {
     layout.visible = false;
     return layout;
@@ -1967,19 +2995,183 @@ bool try_handle_event_log_wheel(GuiState* gui, EventLogLayout const& layout, flo
   return static_cast<float>(win_h) - reserve;
 }
 
-void maybe_auto_advance_unit_sdl(GameSession& session, GuiState* gui, View* v,
-                                 std::optional<int>* sel_unit, int win_w, int win_h) {
-  if (gui == nullptr || !gui->auto_focus_next_unit || !sel_unit->has_value()) {
+[[nodiscard]] float left_ui_column_bottom(UnitInspectorLayout const& unit_layout,
+                                          ProductionNeedsLayout const& needs_layout) noexcept {
+  float bottom = k_top_bar_h + 6.f;
+  if (unit_layout.visible) {
+    bottom = std::max(bottom, unit_layout.panel.y + unit_layout.panel.h);
+  }
+  if (needs_layout.visible) {
+    bottom = std::max(bottom, needs_layout.panel.y + needs_layout.panel.h);
+  }
+  return bottom + 6.f;
+}
+
+void stack_production_needs_below_unit(UnitInspectorLayout const& unit_layout,
+                                       ProductionNeedsLayout* needs_layout) {
+  if (!unit_layout.visible || needs_layout == nullptr || !needs_layout->visible) {
     return;
   }
-  auto u = session.unit_by_id(**sel_unit);
-  if (!u.has_value() || u->owner_seat() != session.current_player().seat) {
+  float const target_y = unit_layout.panel.y + unit_layout.panel.h + 8.f;
+  float const dy = target_y - needs_layout->panel.y;
+  if (dy <= 0.f) {
     return;
   }
-  if (u->moves_remaining() > 0) {
+  needs_layout->panel.y += dy;
+  for (SDL_FRect& btn : needs_layout->jump_buttons) {
+    btn.y += dy;
+  }
+}
+
+void clamp_panel_max_bottom(float max_bottom_y, SDL_FRect* panel) {
+  if (panel == nullptr || max_bottom_y <= panel->y + 80.f) {
     return;
   }
-  cycle_next_unit(session, sel_unit, v, win_w, win_h, gui);
+  if (panel->y + panel->h > max_bottom_y) {
+    panel->h = std::max(80.f, max_bottom_y - panel->y);
+  }
+}
+
+void trim_production_needs_buttons(ProductionNeedsLayout* layout) {
+  if (layout == nullptr || !layout->visible) {
+    return;
+  }
+  float const max_bottom = layout->panel.y + layout->panel.h - 4.f;
+  while (!layout->jump_buttons.empty()) {
+    SDL_FRect const& btn = layout->jump_buttons.back();
+    if (btn.y + btn.h <= max_bottom) {
+      break;
+    }
+    layout->jump_buttons.pop_back();
+    layout->city_ids.pop_back();
+  }
+}
+
+[[nodiscard]] float footer_hint_max_x(BottomActionBarLayout const& action_bar,
+                                      int win_w) noexcept {
+  if (action_bar.visible) {
+    return std::max(240.f, action_bar.action_orb.x - 18.f);
+  }
+  return static_cast<float>(win_w) - 24.f;
+}
+
+[[nodiscard]] char const* claim_legend_body_text() noexcept {
+  return "Border color = owner. Double edge = pressure. Claimed tiles affect city working and "
+         "expansion.";
+}
+
+[[nodiscard]] float claim_legend_card_height() noexcept {
+  float const inner_w = std::min(220.f, k_city_panel_w + 8.f);
+  float const pad = 10.f;
+  auto const lines = menu_ui::wrap_text_to_width(claim_legend_body_text(), inner_w);
+  return pad + 14.f + 6.f + 14.f * static_cast<float>(lines.size()) + pad;
+}
+
+[[nodiscard]] std::vector<std::string> tile_hover_lines(std::string const& full, float wrap_w) {
+  std::vector<std::string> lines;
+  for (std::size_t pos = 0; pos < full.size();) {
+    std::size_t const next = full.find('\n', pos);
+    if (next == std::string::npos) {
+      for (std::string const& wrapped : menu_ui::wrap_text_to_width(full.substr(pos), wrap_w)) {
+        lines.push_back(wrapped);
+      }
+      break;
+    }
+    for (std::string const& wrapped :
+         menu_ui::wrap_text_to_width(full.substr(pos, next - pos), wrap_w)) {
+      lines.push_back(wrapped);
+    }
+    pos = next + 1;
+  }
+  return lines;
+}
+
+[[nodiscard]] float tile_hover_card_total_height(std::size_t line_count) noexcept {
+  if (line_count == 0) {
+    return 0.f;
+  }
+  float const panel_h = 8.f + 14.f * static_cast<float>(line_count);
+  return panel_h + 8.f;
+}
+
+struct TileHoverPlacement {
+  float x = 10.f;
+  float y = 0.f;
+  float wrap_w = 0.f;
+  bool visible = false;
+};
+
+[[nodiscard]] TileHoverPlacement compute_tile_hover_placement(
+    std::string const& hover_line, float hint_max_x,
+    UnitInspectorLayout const& unit_layout, ProductionNeedsLayout const& needs_layout,
+    float legend_ceiling, bool show_claim_legend, float stack_top_y) {
+  TileHoverPlacement out;
+  if (hover_line.empty()) {
+    return out;
+  }
+  out.wrap_w = std::max(160.f, std::min(hint_max_x - 20.f, k_city_panel_w + 20.f));
+  std::vector<std::string> const lines = tile_hover_lines(hover_line, out.wrap_w);
+  float const card_h = tile_hover_card_total_height(lines.size());
+  if (card_h <= 0.f) {
+    return out;
+  }
+
+  float const gap_top = stack_top_y + 6.f;
+  float claim_top = legend_ceiling;
+  if (show_claim_legend) {
+    claim_top -= claim_legend_card_height() + 8.f;
+  }
+  float const gap_bottom = claim_top - 6.f;
+
+  if (gap_bottom - card_h >= gap_top + 12.f) {
+    out.x = 10.f;
+    out.y = gap_bottom - card_h;
+  } else {
+    out.x = k_city_panel_w + 24.f;
+    out.y = gap_top;
+    if (out.y + card_h > gap_bottom - 4.f) {
+      out.y = std::max(k_top_bar_h + 6.f, gap_bottom - card_h - 4.f);
+    }
+  }
+  out.visible = true;
+  return out;
+}
+
+void maybe_auto_advance_action_queue_sdl(GameSession& session, GuiState* gui, View* v,
+                                       std::optional<int>* sel_unit,
+                                       std::optional<int>* sel_city, int win_w, int win_h) {
+  if (gui == nullptr || !gui->auto_focus_next_unit || gui->auto_advance_in_progress) {
+    return;
+  }
+  if (session.is_over() || session.current_player().computer) {
+    return;
+  }
+  int const seat = session.current_player().seat;
+  if (sel_unit->has_value()) {
+    auto u = session.unit_by_id(**sel_unit);
+    if (!u.has_value() || u->owner_seat() != seat) {
+      return;
+    }
+    if (u->moves_remaining() > 0) {
+      return;
+    }
+  } else {
+    return;
+  }
+
+  gui->auto_advance_in_progress = true;
+  std::optional<int> const before_unit = *sel_unit;
+  cycle_next_unit(session, sel_unit, v, win_w, win_h, gui, sel_city);
+  bool advanced = false;
+  if (sel_unit->has_value() && (!before_unit.has_value() || *sel_unit != before_unit)) {
+    advanced = true;
+  } else if (!sdl_has_pending_manual_unit_orders(session, *gui) &&
+             sdl_player_has_city_without_production(session)) {
+    select_first_city_missing_production_sdl(session, v, sel_unit, sel_city, win_w, win_h);
+    advanced = sel_city->has_value();
+  }
+  gui->auto_advance_in_progress = false;
+  static_cast<void>(advanced);
 }
 
 void toggle_auto_focus_next_unit(GuiState* gui) {
@@ -1988,8 +3180,7 @@ void toggle_auto_focus_next_unit(GuiState* gui) {
   }
   gui->auto_focus_next_unit = !gui->auto_focus_next_unit;
   std::string msg = std::string("Auto unit cycling: ") + (gui->auto_focus_next_unit ? "ON" : "OFF");
-  append_event_log(gui, msg);
-  set_toast(gui, std::move(msg), 2800);
+  present_action_feedback(gui, std::move(msg), 2800);
   save_gui_options(*gui);
 }
 
@@ -2014,6 +3205,18 @@ void load_gui_options(GuiState* gui) {
     if (j.contains("tips_dismissed")) {
       gui->tips_dismissed = j.at("tips_dismissed").get<bool>();
     }
+    if (j.contains("show_settler_lens")) {
+      gui->show_settler_lens = j.at("show_settler_lens").get<bool>();
+    }
+    if (j.contains("show_weather_legend")) {
+      gui->show_weather_legend = j.at("show_weather_legend").get<bool>();
+    }
+    if (j.contains("show_claim_legend")) {
+      gui->show_claim_legend = j.at("show_claim_legend").get<bool>();
+    }
+    if (j.contains("minimap_tint_own_claims_only")) {
+      gui->minimap_tint_own_claims_only = j.at("minimap_tint_own_claims_only").get<bool>();
+    }
   } catch (...) {
   }
 }
@@ -2023,9 +3226,927 @@ void save_gui_options(GuiState const& gui) {
     nlohmann::json j;
     j["auto_focus_next_unit"] = gui.auto_focus_next_unit;
     j["tips_dismissed"] = gui.tips_dismissed;
+    j["show_settler_lens"] = gui.show_settler_lens;
+    j["show_weather_legend"] = gui.show_weather_legend;
+    j["show_claim_legend"] = gui.show_claim_legend;
+    j["minimap_tint_own_claims_only"] = gui.minimap_tint_own_claims_only;
     std::ofstream out(k_gui_options_json);
     out << j.dump(2);
   } catch (...) {
+  }
+}
+
+void toggle_settler_lens(GuiState* gui) {
+  if (gui == nullptr) {
+    return;
+  }
+  gui->show_settler_lens = !gui->show_settler_lens;
+  gui->settler_lens_unit_id = -1;
+  std::string msg =
+      std::string("Settler recommendation lens: ") + (gui->show_settler_lens ? "ON" : "OFF");
+  present_action_feedback(gui, std::move(msg), 2800);
+  save_gui_options(*gui);
+}
+
+void toggle_weather_legend(GuiState* gui) {
+  if (gui == nullptr) {
+    return;
+  }
+  gui->show_weather_legend = !gui->show_weather_legend;
+  std::string msg =
+      std::string("Weather tint key: ") + (gui->show_weather_legend ? "ON" : "OFF");
+  present_action_feedback(gui, std::move(msg), 2400);
+  save_gui_options(*gui);
+}
+
+void toggle_claim_legend(GuiState* gui) {
+  if (gui == nullptr) {
+    return;
+  }
+  gui->show_claim_legend = !gui->show_claim_legend;
+  std::string msg = std::string("Territory legend: ") + (gui->show_claim_legend ? "ON" : "OFF");
+  present_action_feedback(gui, std::move(msg), 2400);
+  save_gui_options(*gui);
+}
+
+void toggle_minimap_own_claims(GuiState* gui) {
+  if (gui == nullptr) {
+    return;
+  }
+  gui->minimap_tint_own_claims_only = !gui->minimap_tint_own_claims_only;
+  std::string msg = std::string("Minimap own-claims tint: ") +
+                      (gui->minimap_tint_own_claims_only ? "ON" : "OFF");
+  present_action_feedback(gui, std::move(msg), 2400);
+  save_gui_options(*gui);
+}
+
+void trigger_combat_flash(GuiState* gui, HexCoord h) {
+  if (gui == nullptr) {
+    return;
+  }
+  Uint64 const now = SDL_GetTicks();
+  gui->combat_flash_hex = h;
+  gui->combat_flash_start_ticks = now;
+  gui->combat_flash_until_ticks = now + 520;
+}
+
+void rebuild_settler_lens_cache(GuiState* gui, GameSession const& session, int seat,
+                                int settler_id) {
+  if (gui == nullptr) {
+    return;
+  }
+  gui->settler_lens_hints.clear();
+  if (!gui->show_settler_lens) {
+    return;
+  }
+  auto u = session.unit_by_id(settler_id);
+  if (!u.has_value() || u->kind() != UnitKind::SETTLER || u->owner_seat() != seat || u->is_dead()) {
+    return;
+  }
+  constexpr int k_weight_food = 3;
+  constexpr int k_weight_prod = 3;
+  constexpr int k_weight_gold = 2;
+  constexpr int k_weight_travel = 3;
+  constexpr int k_weight_rival = 2;
+
+  auto const visited = session.visited_for(seat);
+  struct Scored {
+    SettlerLensHint hint;
+  };
+  std::vector<Scored> scored;
+  scored.reserve(visited.size());
+  for (HexCoord const c : visited) {
+    if (!session.map().contains(c) || !can_found_city_on(session.terrain_effective_at(c))) {
+      continue;
+    }
+    if (session.city_at(c).has_value() || session.wild_animal_at(c).has_value()) {
+      continue;
+    }
+    if (u->coord().distance_to(c) > 12) {
+      continue;
+    }
+    auto path = projected_path_to(session, *u, c);
+    if (!path.has_value() || path->size() < 2) {
+      continue;
+    }
+    int const travel_turns = projected_path_turns(*u, *path, session);
+    if (travel_turns > 6) {
+      continue;
+    }
+    bool adjacent_city = false;
+    int adjacent_water = 0;
+    int adjacent_hostile = 0;
+    int rough_neighbors = 0;
+    for (HexCoord const n : c.neighbors()) {
+      if (!session.map().contains(n)) {
+        continue;
+      }
+      if (session.terrain_effective_at(n) == Terrain::WATER) {
+        ++adjacent_water;
+      }
+      if (auto owner = session.claimed_owner_at(n); owner.has_value() && *owner != seat) {
+        ++adjacent_hostile;
+      }
+      Terrain const tn = session.terrain_effective_at(n);
+      if (tn == Terrain::FOREST || tn == Terrain::HILL) {
+        ++rough_neighbors;
+      }
+      if (session.city_at(n).has_value()) {
+        adjacent_city = true;
+        break;
+      }
+    }
+    if (adjacent_city) {
+      continue;
+    }
+    int food = session.tile_food_yield(c);
+    int prod = session.tile_production_yield(c);
+    int gold = session.tile_gold_yield(c);
+    int workable = 0;
+    int rich = 0;
+    for (HexCoord const n : c.neighbors()) {
+      if (!session.map().contains(n) || !tack::strat::passable(session.terrain_effective_at(n))) {
+        continue;
+      }
+      ++workable;
+      int const tf = session.tile_food_yield(n);
+      int const tp = session.tile_production_yield(n);
+      int const tg = session.tile_gold_yield(n);
+      food += tf;
+      prod += tp;
+      gold += tg;
+      if (tf + tp + tg >= 4) {
+        ++rich;
+      }
+    }
+    int near_enemy_penalty = 0;
+    int near_own_bonus = 0;
+    for (City const& ct : session.cities()) {
+      int const d = ct.coord().distance_to(c);
+      if (ct.owner_seat() == seat) {
+        if (d <= 5) {
+          near_own_bonus += 2;
+        }
+      } else if (d <= 4) {
+        near_enemy_penalty += (5 - d) * 2;
+      }
+    }
+    Terrain const center = session.terrain_effective_at(c);
+    int terrain_bonus = 0;
+    switch (center) {
+      case Terrain::HILL:
+        terrain_bonus = 4;
+        break;
+      case Terrain::PLAINS:
+      case Terrain::GRASS:
+        terrain_bonus = 2;
+        break;
+      case Terrain::DESERT:
+        terrain_bonus = -2;
+        break;
+      default:
+        break;
+    }
+    int const coastline_bonus = std::min(3, adjacent_water) * 2;
+    int const defense_bonus = center == Terrain::HILL ? 3 : 0;
+    int score = food * k_weight_food + prod * k_weight_prod + gold * k_weight_gold + rich * 2 +
+                workable * 2 + near_own_bonus + terrain_bonus + coastline_bonus + defense_bonus -
+                near_enemy_penalty - travel_turns * k_weight_travel -
+                adjacent_hostile * k_weight_rival;
+    SettlerLensHint hint;
+    hint.hex = c;
+    hint.score = score;
+    hint.travel_turns = travel_turns;
+    if (food >= 14) {
+      hint.positives.push_back("strong food");
+    }
+    if (prod >= 11) {
+      hint.positives.push_back("strong production");
+    }
+    if (gold >= 9) {
+      hint.positives.push_back("good gold");
+    }
+    if (rich >= 3) {
+      hint.positives.push_back("many rich tiles");
+    }
+    if (near_own_bonus > 0) {
+      hint.positives.push_back("supported by nearby city");
+    }
+    if (adjacent_water >= 2) {
+      hint.positives.push_back("coastal access");
+    }
+    if (center == Terrain::HILL || rough_neighbors >= 3) {
+      hint.positives.push_back("defensible terrain");
+    }
+    if (travel_turns <= 2) {
+      hint.positives.push_back("quick to reach");
+    }
+    if (workable <= 3) {
+      hint.negatives.push_back("few workable neighbors");
+    }
+    if (food <= 9) {
+      hint.negatives.push_back("weak food");
+    }
+    if (prod <= 7) {
+      hint.negatives.push_back("weak production");
+    }
+    if (near_enemy_penalty >= 4) {
+      hint.negatives.push_back("close to enemy city");
+    }
+    if (travel_turns >= 4) {
+      hint.negatives.push_back("long travel time");
+    }
+    if (center == Terrain::DESERT && food <= 10) {
+      hint.negatives.push_back("harsh center tile");
+    }
+    if (adjacent_hostile >= 2) {
+      hint.negatives.push_back("pressure from nearby rival claims");
+    }
+    if (auto owner = session.claimed_owner_at(c); owner.has_value() && *owner != seat) {
+      hint.negatives.push_back("currently in rival claim");
+      score -= 2 + k_weight_rival;
+      hint.score = score;
+    }
+    if (hint.positives.empty()) {
+      hint.positives.push_back("balanced nearby yields");
+    }
+    scored.push_back({std::move(hint)});
+  }
+  std::sort(scored.begin(), scored.end(), [](Scored const& a, Scored const& b) {
+    return a.hint.score > b.hint.score;
+  });
+  int const cap = std::min(10, static_cast<int>(scored.size()));
+  for (int i = 0; i < cap; ++i) {
+    SettlerLensHint hint = scored[static_cast<std::size_t>(i)].hint;
+    hint.rank = i < 3 ? i + 1 : 4;
+    gui->settler_lens_hints.push_back(std::move(hint));
+  }
+  gui->settler_lens_unit_id = settler_id;
+  gui->settler_lens_seat = seat;
+  gui->settler_lens_origin = u->coord();
+}
+
+[[nodiscard]] SettlerLensHint const* settler_lens_hint_at(GuiState const& gui, HexCoord h) {
+  for (SettlerLensHint const& hint : gui.settler_lens_hints) {
+    if (hint.hex == h) {
+      return &hint;
+    }
+  }
+  return nullptr;
+}
+
+[[nodiscard]] std::string settler_lens_hover_line(SettlerLensHint const& hint) {
+  std::string line = "Settle rank #" + std::to_string(hint.rank) + " · score " +
+                     std::to_string(hint.score) + " · " + std::to_string(hint.travel_turns) +
+                     " turn travel";
+  if (!hint.positives.empty()) {
+    line += " · +";
+    for (std::size_t i = 0; i < hint.positives.size(); ++i) {
+      if (i > 0) {
+        line += ", ";
+      }
+      line += hint.positives[i];
+    }
+  }
+  if (!hint.negatives.empty()) {
+    line += " · -";
+    for (std::size_t i = 0; i < hint.negatives.size(); ++i) {
+      if (i > 0) {
+        line += ", ";
+      }
+      line += hint.negatives[i];
+    }
+  }
+  return menu_ui::truncate_line(std::move(line), 110);
+}
+
+void draw_exploration_frontier_shroud(SDL_Renderer* ren, GameSession const& session, View const& v,
+                                      std::unordered_set<HexCoord> const& visited,
+                                      MapScreen const& screen) {
+  for (HexCoord const c : visited) {
+    bool frontier = false;
+    for (HexCoord const n : c.neighbors()) {
+      if (session.map().contains(n) && !visited.count(n)) {
+        frontier = true;
+        break;
+      }
+    }
+    if (!frontier) {
+      continue;
+    }
+    float const cx = axial_to_world_x(c);
+    float const cy = axial_to_world_y(c);
+    if (!hex_on_map_screen(v, cx, cy, screen)) {
+      continue;
+    }
+    fill_hex_solid(ren, v, cx, cy, {0.02f, 0.05f, 0.10f, 0.38f});
+  }
+}
+
+void draw_claim_borders(SDL_Renderer* ren, GameSession const& session, View const& v,
+                        std::unordered_set<HexCoord> const& visible,
+                        std::unordered_set<HexCoord> const& visited, MapScreen const& screen) {
+  for (HexCoord const c : session.map().all_cells()) {
+    if (!visited.count(c)) {
+      continue;
+    }
+    auto const owner = session.claimed_owner_at(c);
+    if (!owner.has_value()) {
+      continue;
+    }
+    RGB const base = player_rgb(*owner);
+    bool const in_sight = visible.count(c);
+    float const er = base.r;
+    float const eg = base.g;
+    float const eb = base.b;
+    float const ea = in_sight ? 228.f / 255.f : 138.f / 255.f;
+    float const cx = axial_to_world_x(c);
+    float const cy = axial_to_world_y(c);
+    if (!hex_on_map_screen(v, cx, cy, screen)) {
+      continue;
+    }
+    for (int edge = 0; edge < 6; ++edge) {
+      HexCoord const n = neighbor_for_edge(c, edge);
+      std::optional<int> n_owner;
+      if (session.map().contains(n)) {
+        n_owner = session.claimed_owner_at(n);
+      }
+      if (n_owner == owner) {
+        continue;
+      }
+      stroke_hex_edge(ren, v, cx, cy, edge, er, eg, eb, ea);
+      if (n_owner.has_value() && *n_owner != *owner) {
+        float const wa = in_sight ? 118.f / 255.f : 78.f / 255.f;
+        stroke_hex_edge(ren, v, cx, cy, edge, 1.f, 1.f, 1.f, wa);
+      }
+    }
+  }
+}
+
+void draw_weather_tile_overlays(SDL_Renderer* ren, GameSession const& session, View const& v,
+                                std::unordered_set<HexCoord> const& visited,
+                                std::unordered_set<HexCoord> const& visible,
+                                MapScreen const& screen) {
+  for (HexCoord const c : visited) {
+    Weather const w = session.weather_at(c);
+    if (w == Weather::CLEAR) {
+      continue;
+    }
+    bool const in_sight = visible.count(c);
+    RGBA wash = weather_wash_rgba(w, in_sight);
+    if (wash.a <= 0.f) {
+      continue;
+    }
+    float const cx = axial_to_world_x(c);
+    float const cy = axial_to_world_y(c);
+    if (!hex_on_map_screen(v, cx, cy, screen)) {
+      continue;
+    }
+    float const fill_a = std::min(1.f, wash.a * 0.90f);
+    fill_hex_solid(ren, v, cx, cy, {wash.r, wash.g, wash.b, fill_a});
+    char const badge = weather_badge_char(w);
+    if (badge == ' ') {
+      continue;
+    }
+    float sx = 0.f;
+    float sy = 0.f;
+    world_to_screen(v, cx + HEX_R * 0.38f, cy - HEX_R * 0.52f, &sx, &sy);
+    SDL_FRect badge_bg{sx - 7.f, sy - 11.f, 14.f, 14.f};
+    SDL_SetRenderDrawColorFloat(ren, 18.f / 255.f, 22.f / 255.f, 30.f / 255.f, 228.f / 255.f);
+    SDL_RenderFillRect(ren, &badge_bg);
+    char label[2] = {badge, '\0'};
+    RGB ink = weather_badge_ink(w);
+    menu_ui::draw_text(ren, sx - 3.f, sy - 2.f, label, ink);
+  }
+}
+
+void draw_selected_unit_tile_glow(SDL_Renderer* ren, GameSession const& session, View const& v,
+                                  std::optional<int> selected_unit_id, int cur_seat,
+                                  std::unordered_set<HexCoord> const& visible,
+                                  std::unordered_set<HexCoord> const& visited) {
+  if (!selected_unit_id.has_value()) {
+    return;
+  }
+  auto u = session.unit_by_id(*selected_unit_id);
+  if (!u.has_value() || u->owner_seat() != cur_seat) {
+    return;
+  }
+  HexCoord const coord = u->coord();
+  if (!visited.count(coord) || !visible.count(coord)) {
+    return;
+  }
+  float const cx = axial_to_world_x(coord);
+  float const cy = axial_to_world_y(coord);
+  fill_hex_overlay(ren, v, cx, cy, 110.f / 255.f, 215.f / 255.f, 255.f / 255.f, 62.f / 255.f,
+                   1.f, 248.f / 255.f, 210.f / 255.f, 22.f / 255.f);
+}
+
+void draw_coast_foam(SDL_Renderer* ren, GameSession const& session, View const& v,
+                     std::unordered_set<HexCoord> const& visible,
+                     std::unordered_set<HexCoord> const& visited, MapScreen const& screen) {
+  if (v.scale < k_lod_detail_min_scale) {
+    return;
+  }
+  for (HexCoord const c : session.map().all_cells()) {
+    if (!visited.count(c) || !visible.count(c)) {
+      continue;
+    }
+    if (session.terrain_effective_at(c) != Terrain::WATER) {
+      continue;
+    }
+    float const cx = axial_to_world_x(c);
+    float const cy = axial_to_world_y(c);
+    if (!hex_on_map_screen(v, cx, cy, screen)) {
+      continue;
+    }
+    for (int edge = 0; edge < 6; ++edge) {
+      HexCoord const n = neighbor_for_edge(c, edge);
+      if (!session.map().contains(n) || !visited.count(n)) {
+        continue;
+      }
+      if (session.terrain_effective_at(n) == Terrain::WATER) {
+        continue;
+      }
+      fill_hex_edge_inward_quad(ren, v, cx, cy, edge, 220.f / 255.f, 246.f / 255.f, 1.f,
+                                72.f / 255.f, 220.f / 255.f, 246.f / 255.f, 1.f, 0.f,
+                                HEX_R * 0.16f);
+    }
+  }
+}
+
+void draw_shore_water_depth(SDL_Renderer* ren, GameSession const& session, View const& v,
+                            std::unordered_set<HexCoord> const& visible,
+                            std::unordered_set<HexCoord> const& visited, MapScreen const& screen) {
+  if (v.scale < k_lod_detail_min_scale) {
+    return;
+  }
+  for (HexCoord const c : session.map().all_cells()) {
+    if (!visited.count(c) || !visible.count(c)) {
+      continue;
+    }
+    if (session.terrain_effective_at(c) != Terrain::WATER) {
+      continue;
+    }
+    float const cx = axial_to_world_x(c);
+    float const cy = axial_to_world_y(c);
+    if (!hex_on_map_screen(v, cx, cy, screen)) {
+      continue;
+    }
+    for (int edge = 0; edge < 6; ++edge) {
+      HexCoord const n = neighbor_for_edge(c, edge);
+      if (!session.map().contains(n) || !visited.count(n)) {
+        continue;
+      }
+      if (session.terrain_effective_at(n) == Terrain::WATER) {
+        continue;
+      }
+      fill_hex_edge_inward_quad(ren, v, cx, cy, edge, 5.f / 255.f, 35.f / 255.f, 72.f / 255.f,
+                                108.f / 255.f, 0.f, 55.f / 255.f, 95.f / 255.f, 0.f,
+                                HEX_R * 0.42f);
+    }
+  }
+}
+
+[[nodiscard]] bool water_tile_is_deep(GameSession const& session, HexCoord c) {
+  for (int edge = 0; edge < 6; ++edge) {
+    HexCoord const n = neighbor_for_edge(c, edge);
+    if (!session.map().contains(n)) {
+      continue;
+    }
+    if (session.terrain_effective_at(n) != Terrain::WATER) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void draw_deep_water_overlay(SDL_Renderer* ren, GameSession const& session, View const& v,
+                             std::unordered_set<HexCoord> const& visible,
+                             std::unordered_set<HexCoord> const& visited,
+                             MapScreen const& screen) {
+  if (v.scale < k_lod_detail_min_scale) {
+    return;
+  }
+  for (HexCoord const c : session.map().all_cells()) {
+    if (!visited.count(c) || !visible.count(c)) {
+      continue;
+    }
+    if (session.terrain_effective_at(c) != Terrain::WATER || !water_tile_is_deep(session, c)) {
+      continue;
+    }
+    float const cx = axial_to_world_x(c);
+    float const cy = axial_to_world_y(c);
+    if (!hex_on_map_screen(v, cx, cy, screen)) {
+      continue;
+    }
+    fill_hex_solid(ren, v, cx, cy, {3.f / 255.f, 18.f / 255.f, 42.f / 255.f, 0.28f});
+  }
+}
+
+void draw_terrain_edge_blends(SDL_Renderer* ren, GameSession const& session, View const& v,
+                              std::unordered_set<HexCoord> const& visible,
+                              std::unordered_set<HexCoord> const& visited,
+                              MapScreen const& screen) {
+  if (v.scale < k_lod_detail_min_scale) {
+    return;
+  }
+  for (HexCoord const c : session.map().all_cells()) {
+    if (!visited.count(c)) {
+      continue;
+    }
+    Terrain const t = session.terrain_effective_at(c);
+    float const cx = axial_to_world_x(c);
+    float const cy = axial_to_world_y(c);
+    if (!hex_on_map_screen(v, cx, cy, screen)) {
+      continue;
+    }
+    for (int edge = 0; edge < 6; ++edge) {
+      HexCoord const n = neighbor_for_edge(c, edge);
+      if (!session.map().contains(n) || !visited.count(n)) {
+        continue;
+      }
+      if (!(c.q < n.q || (c.q == n.q && c.r < n.r))) {
+        continue;
+      }
+      Terrain const tn = session.terrain_effective_at(n);
+      if (tn == t) {
+        continue;
+      }
+      if (!visible.count(c) && !visible.count(n)) {
+        continue;
+      }
+      RGB const ca = terrain_fill(t);
+      RGB const cb = terrain_fill(tn);
+      RGB const mid = blend_rgb(ca, cb, 0.5f);
+      fill_hex_edge_inward_quad(ren, v, cx, cy, edge, mid.r, mid.g, mid.b, 118.f / 255.f, ca.r,
+                                ca.g, ca.b, 0.f, HEX_R * 0.42f);
+      float const ncx = axial_to_world_x(n);
+      float const ncy = axial_to_world_y(n);
+      int const j = edge_index_toward(n, c);
+      if (j < 0) {
+        continue;
+      }
+      fill_hex_edge_inward_quad(ren, v, ncx, ncy, j, mid.r, mid.g, mid.b, 118.f / 255.f, cb.r,
+                                cb.g, cb.b, 0.f, HEX_R * 0.42f);
+    }
+  }
+}
+
+void draw_hex_hover_highlight(SDL_Renderer* ren, View const& v, float cx, float cy,
+                              bool fully_known) {
+  float const lit_a = fully_known ? 52.f / 255.f : 34.f / 255.f;
+  fill_hex_overlay(ren, v, cx, cy, 1.f, 1.f, 1.f, lit_a, 170.f / 255.f, 215.f / 255.f,
+                   255.f / 255.f, fully_known ? 14.f / 255.f : 10.f / 255.f);
+  float const edge_a = fully_known ? 175.f / 255.f : 112.f / 255.f;
+  stroke_hex_screen(ren, v, cx, cy, 205.f / 255.f, 235.f / 255.f, 1.f, edge_a);
+  stroke_hex_screen(ren, v, cx, cy, 1.f, 1.f, 1.f, std::min(1.f, edge_a + 28.f / 255.f));
+}
+
+void draw_thick_screen_line(SDL_Renderer* ren, float x0, float y0, float x1, float y1, float r,
+                            float g, float b, float a, float width) {
+  float const dx = x1 - x0;
+  float const dy = y1 - y0;
+  float const len = std::hypot(dx, dy);
+  if (len < 0.5f) {
+    return;
+  }
+  float const nx = -dy / len;
+  float const ny = dx / len;
+  int const half = std::max(1, static_cast<int>(width * 0.5f));
+  for (int i = -half; i <= half; ++i) {
+    float const ox = nx * static_cast<float>(i);
+    float const oy = ny * static_cast<float>(i);
+    SDL_SetRenderDrawColorFloat(ren, r, g, b, a);
+    SDL_RenderLine(ren, x0 + ox, y0 + oy, x1 + ox, y1 + oy);
+  }
+}
+
+[[nodiscard]] std::size_t path_last_index_reachable_this_turn(
+    Unit const& unit, std::vector<HexCoord> const& path, GameSession const& session) {
+  if (path.size() < 2) {
+    return 0;
+  }
+  int budget = std::max(0, unit.moves_remaining());
+  int spent = 0;
+  std::size_t last = 0;
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    int const cost = session.movement_cost_for_step(unit, path[i]);
+    if (spent + cost > budget) {
+      break;
+    }
+    spent += cost;
+    last = i;
+  }
+  return last;
+}
+
+[[nodiscard]] std::vector<HexCoord> path_turn_endpoints(Unit const& unit,
+                                                        std::vector<HexCoord> const& path,
+                                                        GameSession const& session) {
+  if (path.size() < 2) {
+    return {};
+  }
+  std::vector<HexCoord> markers;
+  int moves_left = std::max(1, unit.moves_remaining());
+  int const per_turn = std::max(1, tack::strat::unit_movement(unit.kind()));
+  int spent = 0;
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    int const step = session.movement_cost_for_step(unit, path[i]);
+    while (step > moves_left - spent) {
+      if (!markers.empty() && markers.back() == path[i - 1]) {
+        break;
+      }
+      markers.push_back(path[i - 1]);
+      spent = 0;
+      moves_left = per_turn;
+    }
+    spent += step;
+    if (spent >= moves_left && i + 1 < path.size()) {
+      if (markers.empty() || markers.back() != path[i]) {
+        markers.push_back(path[i]);
+      }
+      spent = 0;
+      moves_left = per_turn;
+    }
+  }
+  return markers;
+}
+
+void draw_projected_path(SDL_Renderer* ren, View const& v, std::vector<HexCoord> const& path,
+                         int turns, Unit const* unit = nullptr, GameSession const* session = nullptr,
+                         bool dimmed = false) {
+  if (path.size() < 2) {
+    return;
+  }
+  bool const detail = v.scale >= k_lod_detail_min_scale;
+  float const outer_w = (dimmed ? 3.f : (detail ? 5.2f : 4.f)) * v.scale;
+  float const inner_w = (dimmed ? 2.f : (detail ? 3.f : 2.4f)) * v.scale;
+  float const dim_scale = dimmed ? 0.45f : 1.f;
+  std::size_t const last_this_turn =
+      unit != nullptr && session != nullptr
+          ? path_last_index_reachable_this_turn(*unit, path, *session)
+          : path.size() - 1;
+  for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+    float sx0 = 0.f;
+    float sy0 = 0.f;
+    float sx1 = 0.f;
+    float sy1 = 0.f;
+    world_to_screen(v, axial_to_world_x(path[i]), axial_to_world_y(path[i]), &sx0, &sy0);
+    world_to_screen(v, axial_to_world_x(path[i + 1]), axial_to_world_y(path[i + 1]), &sx1, &sy1);
+    bool const this_turn = (i + 1) <= last_this_turn;
+    float const outer_a = (detail ? 95.f : 75.f) / 255.f * dim_scale * (this_turn ? 1.f : 0.55f);
+    float const inner_a = (detail ? 228.f : 200.f) / 255.f * dim_scale * (this_turn ? 1.f : 0.42f);
+    draw_thick_screen_line(ren, sx0, sy0, sx1, sy1, 1.f, 1.f, 1.f, outer_a, outer_w);
+    draw_thick_screen_line(ren, sx0, sy0, sx1, sy1, 45.f / 255.f, 195.f / 255.f, 1.f, inner_a,
+                           inner_w);
+  }
+  if (dimmed) {
+    return;
+  }
+  HexCoord const end = path.back();
+  float ex = 0.f;
+  float ey = 0.f;
+  world_to_screen(v, axial_to_world_x(end), axial_to_world_y(end), &ex, &ey);
+  SDL_FRect badge_bg{ex - 16.f, ey - 26.f, 32.f, 14.f};
+  SDL_SetRenderDrawColorFloat(ren, 0.f, 0.f, 0.f, 170.f / 255.f);
+  SDL_RenderFillRect(ren, &badge_bg);
+  char label[8];
+  std::snprintf(label, sizeof(label), "%dT", turns);
+  menu_ui::draw_text(ren, ex - menu_ui::text_width(label) * 0.5f, ey - 15.f, label, menu_ui::k_title);
+
+  if (unit != nullptr && session != nullptr && turns > 1) {
+    std::vector<HexCoord> const waypoints = path_turn_endpoints(*unit, path, *session);
+    for (HexCoord const wp : waypoints) {
+      if (wp == path.back()) {
+        continue;
+      }
+      float wx = 0.f;
+      float wy = 0.f;
+      world_to_screen(v, axial_to_world_x(wp), axial_to_world_y(wp), &wx, &wy);
+      float const d = std::max(5.f, 7.f * v.scale);
+      SDL_SetRenderDrawColorFloat(ren, 1.f, 1.f, 1.f, 0.85f);
+      SDL_FRect ring{wx - d * 0.5f, wy - d * 0.5f, d, d};
+      SDL_RenderRect(ren, &ring);
+      SDL_SetRenderDrawColorFloat(ren, 35.f / 255.f, 200.f / 255.f, 1.f, 0.92f);
+      SDL_FRect core{wx - d * 0.28f, wy - d * 0.28f, d * 0.56f, d * 0.56f};
+      SDL_RenderFillRect(ren, &core);
+    }
+  }
+}
+
+void draw_other_queued_routes(SDL_Renderer* ren, View const& v, GameSession const& session,
+                              int seat, std::optional<int> selected_unit_id) {
+  for (Unit const& u : session.units()) {
+    if (u.owner_seat() != seat) {
+      continue;
+    }
+    if (selected_unit_id.has_value() && u.id() == *selected_unit_id) {
+      continue;
+    }
+    std::vector<HexCoord> const route = session.planned_route_for(u.id());
+    if (route.empty()) {
+      continue;
+    }
+    std::vector<HexCoord> path;
+    path.push_back(u.coord());
+    path.insert(path.end(), route.begin(), route.end());
+    int const turns = projected_path_turns(u, path, session);
+    draw_projected_path(ren, v, path, turns, &u, &session, true);
+  }
+}
+
+void draw_claim_legend(SDL_Renderer* ren, int win_w, float max_bottom_y, float min_top_y) {
+  float const inner_w = std::min(220.f, k_city_panel_w + 8.f);
+  float const pad = 10.f;
+  char const* const body = claim_legend_body_text();
+  auto const lines = menu_ui::wrap_text_to_width(body, inner_w);
+  float const card_h = claim_legend_card_height();
+  float y = max_bottom_y - card_h - 8.f;
+  if (y < min_top_y || y < k_top_bar_h + 16.f) {
+    return;
+  }
+  SDL_FRect card{10.f, y, inner_w + pad * 2.f, card_h};
+  menu_ui::fill_rect(ren, card, menu_ui::k_modal_bg, 0.80f);
+  menu_ui::stroke_rect(ren, card, menu_ui::k_modal_line, 0.82f);
+  menu_ui::draw_text(ren, card.x + pad, card.y + pad, "Territory borders", menu_ui::k_hint);
+  menu_ui::draw_text_wrapped(ren, card.x + pad, card.y + pad + 16.f, body, inner_w, 14.f,
+                             menu_ui::k_meta, 0.90f);
+}
+
+void draw_time_of_day_overlay(SDL_Renderer* ren, GameSession const& session, int win_w, int win_h) {
+  if (session.is_over()) {
+    return;
+  }
+  float const round_phase = static_cast<float>(session.round()) /
+                            static_cast<float>(std::max(1, session.years_per_full_round()));
+  float const season_phase = static_cast<float>(static_cast<int>(session.season())) / 4.f;
+  float const ph = (round_phase + season_phase) * 6.2831853f;
+  float const sun = std::max(0.f, std::sin(ph));
+  float const twi = std::cos(ph) * std::cos(ph);
+  float const y0 = k_top_bar_h;
+  float const h = static_cast<float>(win_h) - k_top_bar_h - k_footer_bar_h;
+  float const mid = 0.5f;
+  RGB const col{(255.f * (1.f - mid) * (0.11f * twi + 0.05f * sun) + 25.f * mid * (1.f - sun * 0.85f)) /
+                    255.f,
+                (248.f * (1.f - mid) * (0.10f * twi + 0.04f * sun) + 45.f * mid * (1.f - sun * 0.7f)) /
+                    255.f,
+                (220.f * (1.f - mid) * (0.08f * twi) + 92.f * mid * (0.55f + (1.f - sun) * 0.35f)) /
+                    255.f};
+  float const a = 0.08f + 0.04f * (1.f - sun);
+  SDL_FRect band{0.f, y0, static_cast<float>(win_w), h};
+  menu_ui::fill_rect(ren, band, col, a);
+}
+
+void draw_unit_ground_selection_ring(SDL_Renderer* ren, View const& v, Unit const& u,
+                                     GameSession const& session) {
+  float cx = axial_to_world_x(u.coord());
+  float cy = axial_to_world_y(u.coord());
+  if (session.city_at(u.coord()).has_value()) {
+    cy += HEX_R * 0.22f;
+  }
+  cy += HEX_R * 0.12f;
+  float const ring_strength = u.hp() < u.max_hp() ? 0.72f : 0.82f;
+  float const rx = HEX_R * 0.58f * v.scale;
+  float const ry = HEX_R * 0.30f * v.scale;
+  float sx = 0.f;
+  float sy = 0.f;
+  world_to_screen(v, cx, cy, &sx, &sy);
+  bool const injured = u.hp() < u.max_hp();
+  int const segments = 28;
+  for (int i = 0; i < segments; ++i) {
+    float const a0 = 6.2831853f * static_cast<float>(i) / static_cast<float>(segments);
+    float const a1 = 6.2831853f * static_cast<float>(i + 1) / static_cast<float>(segments);
+    float const x0 = sx + std::cos(a0) * (rx + 1.2f);
+    float const y0 = sy + std::sin(a0) * (ry + 0.8f);
+    float const x1 = sx + std::cos(a1) * (rx + 1.2f);
+    float const y1 = sy + std::sin(a1) * (ry + 0.8f);
+    SDL_SetRenderDrawColorFloat(ren, 1.f, 1.f, 1.f,
+                                std::min(1.f, (72.f + 115.f * ring_strength) / 255.f));
+    SDL_RenderLine(ren, x0, y0, x1, y1);
+  }
+  for (int i = 0; i < segments; ++i) {
+    float const a0 = 6.2831853f * static_cast<float>(i) / static_cast<float>(segments);
+    float const a1 = 6.2831853f * static_cast<float>(i + 1) / static_cast<float>(segments);
+    float const x0 = sx + std::cos(a0) * rx;
+    float const y0 = sy + std::sin(a0) * ry;
+    float const x1 = sx + std::cos(a1) * rx;
+    float const y1 = sy + std::sin(a1) * ry;
+    float const core_a = std::min(1.f, (210.f + 35.f * ring_strength) / 255.f);
+    if (injured) {
+      SDL_SetRenderDrawColorFloat(ren, 1.f, 0.28f, 0.20f, core_a);
+    } else {
+      SDL_SetRenderDrawColorFloat(ren, 0.88f, 0.20f, 0.16f, core_a);
+    }
+    SDL_RenderLine(ren, x0, y0, x1, y1);
+  }
+}
+
+void draw_weather_legend(SDL_Renderer* ren, int win_w, int win_h, float max_bottom_y) {
+  static Weather const k_legend_weather[] = {Weather::RAIN,     Weather::DROUGHT, Weather::STORM,
+                                             Weather::COLD_SNAP, Weather::HEAT_WAVE, Weather::FOG};
+  float const chip = 18.f;
+  float const gap = 7.f;
+  float const pad = 12.f;
+  float const chips_w = static_cast<float>(sizeof(k_legend_weather) / sizeof(k_legend_weather[0])) *
+                          chip +
+                      static_cast<float>(
+                          std::max<std::size_t>(0, sizeof(k_legend_weather) / sizeof(k_legend_weather[0]) - 1)) *
+                      gap;
+  float const inner_w = pad * 2.f + chips_w;
+  float const inner_h = pad + 14.f + 10.f + chip + pad;
+  float const box_pad = 10.f;
+  float const x = static_cast<float>(win_w) - inner_w - box_pad - 6.f;
+  float y = max_bottom_y - inner_h - box_pad;
+  if (x < 16.f || y < k_top_bar_h + 16.f) {
+    return;
+  }
+  SDL_FRect card{x, y, inner_w, inner_h};
+  menu_ui::fill_rect(ren, card, menu_ui::k_modal_bg, 0.86f);
+  menu_ui::stroke_rect(ren, card, menu_ui::k_modal_line, 0.78f);
+  menu_ui::draw_text(ren, x + pad, y + pad, "Weather tint key", menu_ui::k_hint);
+  float row_top = y + pad + 14.f + 10.f;
+  float cx = x + pad;
+  for (Weather w : k_legend_weather) {
+    RGBA wash = weather_wash_rgba(w, true);
+    SDL_FRect chip_rect{cx, row_top, chip, chip};
+    menu_ui::fill_rect(ren, chip_rect, {wash.r, wash.g, wash.b}, 248.f / 255.f);
+    char const badge = weather_badge_char(w);
+    if (badge != ' ') {
+      char label[2] = {badge, '\0'};
+      RGB ink = weather_badge_ink(w);
+      menu_ui::draw_text(ren, cx + 5.f, row_top + 3.f, label, ink);
+    }
+    cx += chip + gap;
+  }
+}
+
+void draw_settler_lens_markers(SDL_Renderer* ren, View const& v,
+                               std::vector<SettlerLensHint> const& hints) {
+  for (SettlerLensHint const& hint : hints) {
+    float sx = 0.f;
+    float sy = 0.f;
+    float const wx = axial_to_world_x(hint.hex);
+    float const wy = axial_to_world_y(hint.hex) - HEX_R * 0.62f;
+    world_to_screen(v, wx, wy, &sx, &sy);
+    float const r = std::max(6.f, 10.f * v.scale);
+    RGB fill = hint.rank == 1   ? rgb_u8(0xff, 0xd6, 0x60)
+               : hint.rank == 2 ? rgb_u8(0xf5, 0xc2, 0x4e)
+               : hint.rank == 3 ? rgb_u8(0xe4, 0xb6, 0x3e)
+                                : rgb_u8(0xc8, 0xa0, 0x36);
+    float const tail_h = std::max(8.f, 12.f * v.scale);
+    SDL_SetRenderDrawColorFloat(ren, 0.f, 0.f, 0.f, 0.22f);
+    SDL_FRect shadow{r - r * 0.58f + 1.2f, sy + r * 0.42f + 1.4f, r * 1.16f, tail_h};
+    SDL_RenderFillRect(ren, &shadow);
+    SDL_SetRenderDrawColorFloat(ren, 212.f / 255.f, 168.f / 255.f, 52.f / 255.f, 0.97f);
+    SDL_FRect tail{sx - r * 0.58f, sy + r * 0.42f, r * 1.16f, tail_h};
+    SDL_RenderFillRect(ren, &tail);
+    SDL_SetRenderDrawColorFloat(ren, fill.r, fill.g, fill.b, 0.96f);
+    SDL_FRect head{sx - r, sy - r, 2.f * r, 2.f * r};
+    SDL_RenderFillRect(ren, &head);
+    SDL_SetRenderDrawColorFloat(ren, 0.28f, 0.20f, 0.10f, 0.95f);
+    SDL_RenderRect(ren, &head);
+    SDL_RenderRect(ren, &tail);
+    float const bx = sx - r * 0.35f;
+    float const by = sy - r * 0.28f;
+    SDL_FRect block{bx, by, r * 0.7f, r * 0.85f};
+    SDL_SetRenderDrawColorFloat(ren, 1.f, 0.99f, 0.96f, 0.97f);
+    SDL_RenderFillRect(ren, &block);
+    SDL_SetRenderDrawColorFloat(ren, 0.37f, 0.28f, 0.15f, 0.94f);
+    SDL_RenderRect(ren, &block);
+    if (hint.rank <= 3) {
+      char label[4];
+      std::snprintf(label, sizeof(label), "%d", hint.rank);
+      menu_ui::draw_text(ren, sx - 3.f, sy - 5.f, label, rgb_u8(72, 52, 22));
+    }
+    if (v.scale >= 0.68f) {
+      char eta[8];
+      std::snprintf(eta, sizeof(eta), "%dt", hint.travel_turns);
+      SDL_FRect eta_bg{sx - 10.f, sy + r + tail_h - 2.f, 20.f, 12.f};
+      SDL_SetRenderDrawColorFloat(ren, 16.f / 255.f, 22.f / 255.f, 30.f / 255.f, 215.f / 255.f);
+      SDL_RenderFillRect(ren, &eta_bg);
+      menu_ui::draw_text(ren, sx - 6.f, sy + r + tail_h - 1.f, eta, rgb_u8(235, 242, 255));
+    }
+  }
+}
+
+void draw_combat_flash(SDL_Renderer* ren, View const& v, HexCoord h, Uint64 start_ticks,
+                       Uint64 until_ticks) {
+  Uint64 const now = SDL_GetTicks();
+  if (now >= until_ticks) {
+    return;
+  }
+  float const span = static_cast<float>(std::max<Uint64>(1, until_ticks - start_ticks));
+  float u = static_cast<float>(now - start_ticks) / span;
+  u = std::clamp(u, 0.f, 1.f);
+  float const cx = axial_to_world_x(h);
+  float const cy = axial_to_world_y(h);
+  int const core_a = static_cast<int>(155.f * (1.f - u * 0.92f));
+  fill_hex_solid(ren, v, cx, cy,
+                 {1.f, 65.f / 255.f, 65.f / 255.f, std::min(220, std::max(0, core_a)) / 255.f});
+  float const edge = 1.f - u * 0.88f;
+  stroke_hex_screen(ren, v, cx, cy, 1.f, 210.f / 255.f, 140.f / 255.f, edge * 0.85f);
+  if (u < 0.88f) {
+    stroke_hex_screen(ren, v, cx, cy, 1.f, 1.f, 1.f, (1.f - u) * 0.49f);
   }
 }
 
@@ -2041,7 +4162,7 @@ void dismiss_intro_tips(GuiState* gui) {
 struct GameMenuLayout {
   SDL_FRect menu_btn{};
   SDL_FRect panel{};
-  std::array<SDL_FRect, 5> items{};
+  std::array<SDL_FRect, 10> items{};
 };
 
 [[nodiscard]] GameMenuLayout compute_game_menu_layout(int win_w) noexcept {
@@ -2050,8 +4171,8 @@ struct GameMenuLayout {
   float const btn_h = 24.f;
   layout.menu_btn = {static_cast<float>(win_w) - btn_w - 8.f, 12.f, btn_w, btn_h};
   float const row_h = 28.f;
-  float const panel_w = 232.f;
-  float const panel_h = row_h * 5.f + 10.f;
+  float const panel_w = 248.f;
+  float const panel_h = row_h * 10.f + 10.f;
   layout.panel = {layout.menu_btn.x + layout.menu_btn.w - panel_w,
                   layout.menu_btn.y + layout.menu_btn.h + 2.f, panel_w, panel_h};
   float y = layout.panel.y + 5.f;
@@ -2062,7 +4183,8 @@ struct GameMenuLayout {
   return layout;
 }
 
-void draw_game_menu_ui(SDL_Renderer* ren, GuiState const& gui, int win_w) {
+void draw_game_menu_ui(SDL_Renderer* ren, GuiState const& gui, GameSession const& session,
+                       int win_w) {
   GameMenuLayout const layout = compute_game_menu_layout(win_w);
   menu_ui::draw_button(ren, layout.menu_btn, "Menu", menu_ui::k_secondary, menu_ui::k_secondary_line,
                        menu_ui::k_ink, true);
@@ -2071,14 +4193,29 @@ void draw_game_menu_ui(SDL_Renderer* ren, GuiState const& gui, int win_w) {
   }
   menu_ui::fill_rect(ren, layout.panel, menu_ui::k_modal_bg, 0.98f);
   menu_ui::stroke_rect(ren, layout.panel, menu_ui::k_modal_line, 0.9f);
-  char const* labels[5] = {"Save game...", "Next unit", "End turn", nullptr, "Main menu"};
   std::string auto_label = std::string("Auto unit cycling: ") +
                            (gui.auto_focus_next_unit ? "On (toggle)" : "Off (toggle)");
-  labels[3] = auto_label.c_str();
-  for (int i = 0; i < 5; ++i) {
-    bool const enabled = i != 3;
+  std::string lens_label = std::string("Settler lens: ") +
+                           (gui.show_settler_lens ? "On (toggle)" : "Off (toggle)");
+  std::string minimap_label = std::string("Minimap own claims: ") +
+                              (gui.minimap_tint_own_claims_only ? "On (toggle)" : "Off (toggle)");
+  std::string end_turn_label = "End turn";
+  if (!session.is_over() && !session.current_player().computer) {
+    bool const units_pending = sdl_has_pending_manual_unit_orders(session, gui);
+    bool const prod_pending = sdl_player_has_city_without_production(session);
+    if (units_pending) {
+      end_turn_label = "End turn (units need orders)";
+    } else if (prod_pending) {
+      end_turn_label = "End turn (production needed)";
+    }
+  }
+  char const* labels[10] = {"Save game...",        "Load game...",       "Next unit",
+                            end_turn_label.c_str(), auto_label.c_str(), lens_label.c_str(),
+                            minimap_label.c_str(),  "Fit discovered map", "Clear unit skips",
+                            "Main menu"};
+  for (int i = 0; i < 10; ++i) {
     menu_ui::draw_button(ren, layout.items[static_cast<std::size_t>(i)], labels[i],
-                         menu_ui::k_secondary, menu_ui::k_secondary_line, menu_ui::k_ink, enabled);
+                         menu_ui::k_secondary, menu_ui::k_secondary_line, menu_ui::k_ink, true);
   }
 }
 
@@ -2100,7 +4237,7 @@ bool try_handle_game_menu_click(GameSession& session, GuiState* gui, View* view,
     gui->show_game_menu = false;
     return true;
   }
-  for (int i = 0; i < 5; ++i) {
+  for (int i = 0; i < 10; ++i) {
     if (!screen_point_in_rect(mx, my, layout.items[static_cast<std::size_t>(i)])) {
       continue;
     }
@@ -2110,15 +4247,40 @@ bool try_handle_game_menu_click(GameSession& session, GuiState* gui, View* view,
         gui->request_save = true;
         break;
       case 1:
-        cycle_next_unit(session, sel_unit, view, win_w, win_h, gui);
+        gui->request_load = true;
         break;
       case 2:
-        do_end_turn_sdl(session, gui, view, sel_unit, sel_city, win_w, win_h, flow);
+        cycle_next_unit(session, sel_unit, view, win_w, win_h, gui, sel_city);
         break;
-      case 3:
+      case 3: {
+        PrimaryActionState const act =
+            compute_primary_action_state(session, *gui, *sel_unit, *sel_city);
+        on_hud_action_click(session, gui, view, sel_unit, sel_city, act, std::nullopt, win_w, win_h,
+                            flow);
+        break;
+      }
+      case 4:
         toggle_auto_focus_next_unit(gui);
         break;
-      case 4:
+      case 5:
+        toggle_settler_lens(gui);
+        break;
+      case 6:
+        toggle_minimap_own_claims(gui);
+        break;
+      case 7:
+        fit_map_to_window(view, win_w, win_h);
+        present_action_feedback(gui, "View fitted to discovered territory.", 2400);
+        break;
+      case 8:
+        if (!gui->skipped_units.empty()) {
+          gui->skipped_units.clear();
+          present_action_feedback(gui, "Cleared unit skip marks for this turn.", 2400);
+        } else {
+          set_toast(gui, "No units are marked skipped this turn.", 2400);
+        }
+        break;
+      case 9:
         gui->request_main_menu = true;
         break;
       default:
@@ -2134,7 +4296,7 @@ void draw_intro_tips_overlay(SDL_Renderer* ren, int win_w, int win_h) {
   float const h = static_cast<float>(win_h) - k_top_bar_h - k_footer_bar_h;
   menu_ui::fill_rect(ren, {0.f, y0, static_cast<float>(win_w), h}, menu_ui::k_ink, 0.48f);
   float const panel_w = std::min(420.f, static_cast<float>(win_w) - 48.f);
-  float const panel_h = 196.f;
+  float const panel_h = 212.f;
   float const px = (static_cast<float>(win_w) - panel_w) * 0.5f;
   float const py = y0 + h * 0.5f - panel_h * 0.5f;
   SDL_FRect card{px, py, panel_w, panel_h};
@@ -2142,9 +4304,12 @@ void draw_intro_tips_overlay(SDL_Renderer* ren, int win_w, int win_h) {
   menu_ui::draw_text(ren, card.x + 16.f, card.y + 14.f, "Welcome", menu_ui::k_accent);
   char const* lines[] = {
       "Pan and zoom with drag, wheel, and arrow keys.",
-      "Enter ends your turn when nothing is pending.",
+      "The round action button (bottom-right) shows Move, Next, or End Turn.",
+      "Enter or P triggers that action; green pulse means you can end the turn.",
+      "Click distant tiles to move; Shift+click queues multi-turn routes.",
+      "Auto unit cycling is on (U to toggle) - finishes jump to the next unit or city.",
       "B founds a city; production opens when you select a city.",
-      "Shift+E toggles auto-explore for the selected unit.",
+      "Shift+E toggles auto-explore; H toggles settler site pins.",
       "F1 lists all hotkeys. Esc opens the game menu.",
       "Press Enter, Esc, or click to dismiss these tips.",
   };
@@ -2162,28 +4327,48 @@ void draw_intro_tips_overlay(SDL_Renderer* ren, int win_w, int win_h) {
   if (session.is_over() || session.current_player().computer) {
     return state;
   }
-  state.enabled = true;
+
+  bool const units_pending = sdl_has_pending_manual_unit_orders(session, gui);
+  bool const prod_pending = sdl_player_has_city_without_production(session);
   int const seat = session.current_player().seat;
 
-  if (gui.move_command_mode) {
-    state.label = "Commit move";
-    state.detail = "Arrows adjust route, Enter confirms projected move";
+  if (!units_pending && !prod_pending) {
+    state.kind = HudActionKind::EndTurn;
+    state.label = "End Turn";
+    state.detail = "All orders given — click or press Enter to play your turn";
+    state.enabled = true;
+    state.end_turn_ready = true;
     return state;
+  }
+
+  state.enabled = true;
+
+  if (gui.move_command_mode && selected_unit_id.has_value()) {
+    if (auto u = session.unit_by_id(*selected_unit_id);
+        u.has_value() && u->owner_seat() == seat) {
+      state.kind = HudActionKind::CommitMove;
+      state.label = "Confirm";
+      state.detail =
+          "Arrows adjust route; Enter confirms or advances if the move is not valid";
+      return state;
+    }
   }
 
   if (selected_unit_id.has_value()) {
     auto u = session.unit_by_id(*selected_unit_id);
     if (u.has_value() && u->owner_seat() != seat) {
-      state.label = "Enemy unit";
-      state.detail = "Enemy selected - inspect only";
+      state.kind = HudActionKind::Wait;
+      state.label = "Inspect";
+      state.detail = "Enemy unit — select one of yours";
       state.enabled = false;
       return state;
     }
     if (u.has_value()) {
       if (u->kind() == UnitKind::SETTLER) {
-        state.label = "Found city";
+        state.kind = HudActionKind::FoundCity;
+        state.label = "Found";
         if (session.can_found_city(*u)) {
-          state.detail = "This settler can found here (B)";
+          state.detail = "Found a city on this tile (B)";
         } else if (auto why = session.explain_cannot_found_city(*u)) {
           state.detail = *why;
         } else {
@@ -2191,42 +4376,71 @@ void draw_intro_tips_overlay(SDL_Renderer* ren, int win_w, int win_h) {
         }
         return state;
       }
-      if (!session.planned_route_for(*selected_unit_id).empty()) {
-        state.label = "Follow route";
-        state.detail = "Route queued - continue along path";
+      if (!session.planned_route_for(*selected_unit_id).empty() && u->moves_remaining() > 0) {
+        state.kind = HudActionKind::FollowRoute;
+        state.label = "Go";
+        state.detail = "Follow the queued route (click map or P)";
         return state;
       }
       if (u->sleeping()) {
-        state.label = "Wake unit";
-        state.detail = "Sleeping units ignore orders until woken";
+        state.kind = HudActionKind::Wake;
+        state.label = "Wake";
+        state.detail = "Wake this unit so it can take orders";
         return state;
       }
-      state.label = "Move mode";
-      state.detail = "Enter move mode (M), then arrows and Enter";
+      if (u->moves_remaining() <= 0) {
+        state.kind = HudActionKind::NextUnit;
+        state.label = "Next";
+        state.detail = "This unit is done — find the next needing orders";
+        return state;
+      }
+      state.kind = HudActionKind::Move;
+      state.label = "Move";
+      if (civilian_kind(u->kind())) {
+        state.detail = "Click a tile to move; Shift+click queues a multi-turn route";
+      } else {
+        state.detail = "Click to move, or M for move mode";
+      }
       if (u->auto_explore()) {
-        state.detail += " - auto-explore on end turn";
+        state.detail += " (auto-explore at end turn)";
       }
       return state;
     }
   }
 
-  if (selected_city_id.has_value()) {
-    auto c = session.city_by_id(*selected_city_id);
-    if (c.has_value() && c->owner_seat() != seat) {
-      state.label = "Enemy city";
-      state.detail = "Foreign city - inspect only";
-      state.enabled = false;
-      return state;
-    }
-    if (c.has_value() && c->owner_seat() == seat) {
-      state.label = "Choose production";
-      state.detail = "Use the Build panel on the right (keys 1-6)";
+  if (!selected_unit_id.has_value() && selected_city_id.has_value()) {
+    if (auto c = session.city_by_id(*selected_city_id);
+        c.has_value() && c->owner_seat() == seat) {
+      if (units_pending) {
+        state.kind = HudActionKind::NextUnit;
+        state.label = "Next";
+        state.detail = "Units still need orders — jump to the next";
+        return state;
+      }
+      state.kind = HudActionKind::Production;
+      state.label = "Build";
+      state.detail = prod_pending ? "Choose city production in the Build panel (keys 1-6)"
+                                : "Inspect city production in the Build panel";
       return state;
     }
   }
 
-  state.label = "Next unit";
-  state.detail = "No selection - cycle to next unit needing orders";
+  if (prod_pending) {
+    state.kind = HudActionKind::Production;
+    state.label = "Build";
+    state.detail = "Choose city production in the Build panel (keys 1-6)";
+    return state;
+  }
+
+  if (units_pending) {
+    state.kind = HudActionKind::NextUnit;
+    state.label = "Next";
+    state.detail = "Find the next unit needing orders";
+    return state;
+  }
+
+  state.kind = HudActionKind::Wait;
+  state.enabled = false;
   return state;
 }
 
@@ -2238,59 +4452,259 @@ void draw_intro_tips_overlay(SDL_Renderer* ren, int win_w, int win_h) {
     return layout;
   }
   layout.visible = true;
-  layout.primary =
+  layout.action =
       compute_primary_action_state(session, gui, selected_unit_id, selected_city_id);
 
-  bool const units_pending = sdl_has_pending_manual_unit_orders(session, gui);
-  bool const prod_pending = sdl_player_has_city_without_production(session);
-  layout.end_turn_enabled = !units_pending && !prod_pending;
-  if (units_pending) {
-    layout.end_turn_label = "Units need orders";
-  } else if (prod_pending) {
-    layout.end_turn_label = "City needs production";
-  } else {
-    layout.end_turn_label = "End turn (Enter)";
-  }
-
   float const foot_y = static_cast<float>(win_h) - k_footer_bar_h;
-  float const btn_y = foot_y + 8.f;
-  float const btn_h = 32.f;
-  float const end_w = 210.f;
-  float const prim_w = 240.f;
-  float const gap = 8.f;
-  layout.end_turn_btn = {static_cast<float>(win_w) - end_w - 10.f, btn_y, end_w, btn_h};
-  layout.primary_btn = {layout.end_turn_btn.x - gap - prim_w, btn_y, prim_w, btn_h};
+  float const orb_cx = static_cast<float>(win_w) - k_hud_action_orb_d * 0.5f - 20.f;
+  float const orb_cy = foot_y - k_hud_action_orb_d * 0.12f;
+  layout.action_orb = {orb_cx - k_hud_action_orb_d * 0.5f, orb_cy - k_hud_action_orb_d * 0.5f,
+                       k_hud_action_orb_d, k_hud_action_orb_d};
+  layout.pending_unit_count = count_units_needing_manual_orders(session, gui);
+  float const caption_h = 36.f;
+  layout.action_hit = {layout.action_orb.x - 8.f, layout.action_orb.y - 8.f,
+                       layout.action_orb.w + 16.f, layout.action_orb.h + caption_h};
   return layout;
 }
 
-void draw_bottom_action_bar(SDL_Renderer* ren, BottomActionBarLayout const& layout) {
+[[nodiscard]] bool screen_point_in_circle(float px, float py, SDL_FRect const& orb) noexcept {
+  float const cx = orb.x + orb.w * 0.5f;
+  float const cy = orb.y + orb.h * 0.5f;
+  float const r = orb.w * 0.5f;
+  float const dx = px - cx;
+  float const dy = py - cy;
+  return dx * dx + dy * dy <= r * r;
+}
+
+void fill_circle(SDL_Renderer* ren, float cx, float cy, float r, RGB c, float a) {
+  int const steps = std::max(4, static_cast<int>(r * 1.6f));
+  for (int i = 0; i < steps; ++i) {
+    float const t = (static_cast<float>(i) + 0.5f) / static_cast<float>(steps);
+    float const y = cy - r + t * 2.f * r;
+    float const dy = y - cy;
+    float const half = std::sqrt(std::max(0.f, r * r - dy * dy));
+    menu_ui::fill_rect(ren, {cx - half, y, half * 2.f, 1.f}, c, a);
+  }
+}
+
+void fill_triangle(SDL_Renderer* ren, float x0, float y0, float x1, float y1, float x2, float y2,
+                   RGB c, float a) {
+  float const min_y = std::min({y0, y1, y2});
+  float const max_y = std::max({y0, y1, y2});
+  int const steps = std::max(2, static_cast<int>((max_y - min_y) * 1.2f));
+  for (int i = 0; i < steps; ++i) {
+    float const y = min_y + (static_cast<float>(i) + 0.5f) / static_cast<float>(steps) *
+                                  (max_y - min_y);
+    auto edge_x = [&](float ax, float ay, float bx, float by) -> std::optional<float> {
+      if ((ay <= y && by > y) || (by <= y && ay > y)) {
+        float const t = (y - ay) / (by - ay);
+        return ax + t * (bx - ax);
+      }
+      return std::nullopt;
+    };
+    std::vector<float> xs;
+    for (auto const x : {edge_x(x0, y0, x1, y1), edge_x(x1, y1, x2, y2), edge_x(x2, y2, x0, y0)}) {
+      if (x.has_value()) {
+        xs.push_back(*x);
+      }
+    }
+    if (xs.size() >= 2) {
+      float const left = std::min(xs[0], xs[1]);
+      float const right = std::max(xs[0], xs[1]);
+      menu_ui::fill_rect(ren, {left, y, right - left, 1.f}, c, a);
+    }
+  }
+}
+
+void draw_hud_action_icon(SDL_Renderer* ren, HudActionKind kind, float cx, float cy, float r,
+                          RGB color, float alpha) {
+  float const s = r * 0.42f;
+  auto draw_chevron = [&](float tip_x, float half_h, float back_x) {
+    fill_triangle(ren, back_x, cy - half_h, back_x, cy + half_h, tip_x, cy, color, alpha);
+  };
+  switch (kind) {
+    case HudActionKind::EndTurn: {
+      float const x0 = cx - s * 0.62f;
+      float const y0 = cy - s * 0.82f;
+      float const x1 = cx - s * 0.62f;
+      float const y1 = cy + s * 0.82f;
+      float const x2 = cx + s * 1.05f;
+      float const y2 = cy;
+      fill_triangle(ren, x0, y0, x1, y1, x2, y2, color, alpha);
+      break;
+    }
+    case HudActionKind::NextUnit:
+      draw_chevron(cx + s * 0.15f, s * 0.72f, cx - s * 0.42f);
+      draw_chevron(cx + s * 0.72f, s * 0.72f, cx + s * 0.15f);
+      break;
+    case HudActionKind::Move:
+      draw_chevron(cx + s * 0.55f, s * 0.78f, cx - s * 0.35f);
+      break;
+    case HudActionKind::FollowRoute:
+      draw_chevron(cx + s * 0.62f, s * 0.82f, cx - s * 0.42f);
+      break;
+    case HudActionKind::FoundCity:
+      menu_ui::draw_text_centered(ren, cx, cy - 7.f, "+", color, alpha);
+      break;
+    case HudActionKind::Wake:
+      menu_ui::draw_text_centered(ren, cx, cy - 7.f, "!", color, alpha);
+      break;
+    case HudActionKind::Production:
+      menu_ui::draw_text_centered(ren, cx, cy - 7.f, "B", color, alpha);
+      break;
+    case HudActionKind::CommitMove:
+      menu_ui::draw_text_centered(ren, cx, cy - 7.f, "OK", color, alpha);
+      break;
+    default:
+      menu_ui::draw_text_centered(ren, cx, cy - 7.f, "...", menu_ui::k_muted, alpha * 0.7f);
+      break;
+  }
+}
+
+void draw_bottom_action_bar(SDL_Renderer* ren, BottomActionBarLayout const& layout, bool hovered) {
   if (!layout.visible) {
     return;
   }
-  std::string primary_text = layout.primary.label;
-  if (primary_text.size() > 28) {
-    primary_text.resize(25);
-    primary_text += "...";
+  PrimaryActionState const& act = layout.action;
+  float const cx = layout.action_orb.x + layout.action_orb.w * 0.5f;
+  float const cy = layout.action_orb.y + layout.action_orb.h * 0.5f;
+  float const r = layout.action_orb.w * 0.5f;
+  Uint64 const now = SDL_GetTicks();
+
+  float const pulse = 0.55f + 0.35f * std::sin(static_cast<float>(now) * 0.005f);
+  if (act.end_turn_ready) {
+    fill_circle(ren, cx, cy, r + 10.f, menu_ui::k_ok, pulse * 0.28f);
+    fill_circle(ren, cx, cy, r + 5.f, menu_ui::k_ok, pulse * 0.42f);
+  } else if (layout.pending_unit_count > 0) {
+    fill_circle(ren, cx, cy, r + 7.f, rgb_u8(255, 150, 50), pulse * 0.22f);
   }
-  draw_inspector_action_btn(ren, layout.primary_btn, primary_text.c_str(), layout.primary.enabled,
-                            false);
-  std::string end_text = layout.end_turn_label;
-  if (end_text.size() > 26) {
-    end_text.resize(23);
-    end_text += "...";
+  if (hovered && act.enabled) {
+    fill_circle(ren, cx, cy, r + 5.f, menu_ui::k_title, 0.18f);
   }
-  menu_ui::draw_button(ren, layout.end_turn_btn, end_text.c_str(),
-                       layout.end_turn_enabled ? menu_ui::k_primary : menu_ui::k_secondary,
-                       layout.end_turn_enabled ? menu_ui::k_primary_dark : menu_ui::k_secondary_line,
-                       layout.end_turn_enabled ? menu_ui::k_title : menu_ui::k_disabled,
-                       layout.end_turn_enabled, layout.end_turn_enabled);
+
+  fill_circle(ren, cx, cy, r + 2.f, menu_ui::k_ink, 0.92f);
+  RGB const face = act.end_turn_ready ? menu_ui::k_ok
+                                      : (act.enabled ? menu_ui::k_primary : rgb_u8(48, 58, 72));
+  float const face_a = act.enabled ? (hovered ? 1.f : 0.96f) : 0.72f;
+  fill_circle(ren, cx, cy, r, face, face_a);
+  RGB const ring = act.end_turn_ready ? menu_ui::k_victory_gold : menu_ui::k_title;
+  float const ring_a = act.enabled ? (hovered ? 1.f : 0.92f) : 0.45f;
+  for (int i = 0; i < 28; ++i) {
+    float const a0 = 6.2831853f * static_cast<float>(i) / 28.f;
+    float const a1 = 6.2831853f * static_cast<float>(i + 1) / 28.f;
+    SDL_SetRenderDrawColorFloat(ren, ring.r, ring.g, ring.b, ring_a);
+    SDL_RenderLine(ren, cx + std::cos(a0) * r, cy + std::sin(a0) * r, cx + std::cos(a1) * r,
+                   cy + std::sin(a1) * r);
+  }
+
+  RGB const icon_color = act.end_turn_ready ? menu_ui::k_ink : menu_ui::k_title;
+  draw_hud_action_icon(ren, act.kind, cx, cy, r, icon_color, act.enabled ? 1.f : 0.55f);
+
+  if (layout.pending_unit_count > 0 && !act.end_turn_ready) {
+    float const bx = cx + r * 0.58f;
+    float const by = cy - r * 0.62f;
+    fill_circle(ren, bx, by, 11.f, rgb_u8(255, 120, 40), 0.96f);
+    std::string const badge = std::to_string(layout.pending_unit_count);
+    menu_ui::draw_text_centered(ren, bx, by - 7.f, badge.c_str(), menu_ui::k_ink, 1.f);
+  }
+
+  std::string caption = act.label;
+  if (act.end_turn_ready) {
+    caption = "End Turn";
+  }
+  float const cap_w = menu_ui::text_width(caption.c_str());
+  menu_ui::draw_text(ren, cx - cap_w * 0.5f, layout.action_orb.y + layout.action_orb.h + 4.f,
+                     caption.c_str(), act.end_turn_ready ? menu_ui::k_ok : menu_ui::k_hint, 0.95f);
+  if (act.end_turn_ready) {
+    menu_ui::draw_text_centered(ren, cx, layout.action_orb.y + layout.action_orb.h + 18.f, "Enter",
+                                menu_ui::k_muted, 0.82f);
+  } else if (act.enabled && act.kind != HudActionKind::Wait) {
+    menu_ui::draw_text_centered(ren, cx, layout.action_orb.y + layout.action_orb.h + 18.f,
+                                "P / Enter", menu_ui::k_muted, 0.78f);
+  }
 }
 
-void draw_menu_toast(SDL_Renderer* ren, GuiState const& gui, int win_w, int win_h) {
+void clear_move_command_mode(GuiState* gui) {
+  if (gui == nullptr) {
+    return;
+  }
+  gui->move_command_mode = false;
+  gui->move_cursor.reset();
+  gui->move_cursor_locked = false;
+}
+
+void advance_hud_action_queue(GameSession& session, GuiState* gui, View* view,
+                              std::optional<int>* sel_unit, std::optional<int>* sel_city,
+                              int win_w, int win_h) {
+  std::optional<int> const before_unit = *sel_unit;
+  std::optional<int> const before_city = *sel_city;
+
+  if (sdl_has_pending_manual_unit_orders(session, *gui)) {
+    cycle_next_unit(session, sel_unit, view, win_w, win_h, gui, sel_city);
+    if (*sel_unit != before_unit || *sel_city != before_city) {
+      return;
+    }
+  }
+  if (sdl_player_has_city_without_production(session)) {
+    select_first_city_missing_production_sdl(session, view, sel_unit, sel_city, win_w, win_h);
+    if (*sel_city != before_city) {
+      set_toast(gui, "Choose production in the Build panel (keys 1-6).", 3600);
+      return;
+    }
+  }
+  if (!sdl_has_pending_manual_unit_orders(session, *gui) &&
+      !sdl_player_has_city_without_production(session)) {
+    set_toast(gui, "No units need orders this turn.", 2800);
+  }
+}
+
+void on_hud_action_click(GameSession& session, GuiState* gui, View* view,
+                         std::optional<int>* sel_unit, std::optional<int>* sel_city,
+                         PrimaryActionState const& action, std::optional<HexCoord> hovered_hex,
+                         int win_w, int win_h, SdlSessionFlow const* flow) {
+  if (action.end_turn_ready) {
+    do_end_turn_sdl(session, gui, view, sel_unit, sel_city, win_w, win_h, flow);
+    return;
+  }
+  if (!action.enabled) {
+    if (!action.detail.empty()) {
+      set_toast(gui, action.detail, 3600);
+    }
+    return;
+  }
+  if (action.kind == HudActionKind::CommitMove) {
+    if (commit_move_command(session, gui, sel_unit, sel_city, hovered_hex, view, win_w, win_h)) {
+      return;
+    }
+    clear_move_command_mode(gui);
+    advance_hud_action_queue(session, gui, view, sel_unit, sel_city, win_w, win_h);
+    return;
+  }
+  if (action.kind == HudActionKind::NextUnit) {
+    advance_hud_action_queue(session, gui, view, sel_unit, sel_city, win_w, win_h);
+    return;
+  }
+  if (action.kind == HudActionKind::Production) {
+    select_first_city_missing_production_sdl(session, view, sel_unit, sel_city, win_w, win_h);
+    set_toast(gui, "Choose production in the Build panel (keys 1-6).", 3600);
+    return;
+  }
+  on_primary_action_sdl(session, gui, view, sel_unit, sel_city, hovered_hex, win_w, win_h, flow);
+}
+
+void draw_menu_toast(SDL_Renderer* ren, GuiState const& gui, int win_w, int win_h,
+                     float toast_max_right = 0.f) {
   Uint64 const now = SDL_GetTicks();
   if (now >= gui.toast_until_ticks || gui.toast_text.empty()) {
     return;
   }
+  Uint64 const remaining = gui.toast_until_ticks - now;
+  float fade = 1.f;
+  if (remaining < 650) {
+    fade = static_cast<float>(remaining) / 650.f;
+  }
+  bool const warn = gui.toast_is_warning;
+  bool const ok = !warn && sdl_action_message_is_success(gui.toast_text);
   float const max_w = std::min(560.f, static_cast<float>(win_w) - 96.f);
   int const budget = std::max(48, static_cast<int>(max_w / 7.f));
   std::string line1 = gui.toast_text;
@@ -2315,24 +4729,37 @@ void draw_menu_toast(SDL_Renderer* ren, GuiState const& gui, int win_w, int win_
   }
   float const toast_h = line2.empty() ? 34.f : 50.f;
   float const toast_w = max_w + 28.f;
-  float const tx = (static_cast<float>(win_w) - toast_w) * 0.5f;
+  float tx = (static_cast<float>(win_w) - toast_w) * 0.5f;
+  if (toast_max_right > 0.f) {
+    float const max_tx = toast_max_right - toast_w - 16.f;
+    tx = std::min(tx, max_tx);
+    tx = std::max(12.f, tx);
+  }
   float const ty = static_cast<float>(win_h) - toast_h - 28.f;
-  menu_ui::fill_rect(ren, {tx + 3.f, ty + 3.f, toast_w, toast_h}, menu_ui::k_ink, 0.35f);
-  menu_ui::fill_rect(ren, {tx, ty, toast_w, toast_h}, rgb_u8(0x14, 0x1f, 0x31), 0.96f);
-  menu_ui::stroke_rect(ren, {tx, ty, toast_w, toast_h}, menu_ui::k_accent, 0.85f);
-  menu_ui::draw_text_centered(ren, static_cast<float>(win_w) * 0.5f, ty + 8.f, line1.c_str(),
-                              menu_ui::k_accent);
+  RGB const bg = warn ? rgb_u8(0x2a, 0x12, 0x12) : ok ? rgb_u8(0x12, 0x2a, 0x18) : rgb_u8(0x14, 0x1f, 0x31);
+  RGB const border =
+      warn ? rgb_u8(0xff, 0x88, 0x66) : ok ? menu_ui::k_ok : menu_ui::k_accent;
+  RGB const ink =
+      warn ? rgb_u8(0xff, 0xc8, 0xb8) : ok ? rgb_u8(0xc8, 0xff, 0xd8) : menu_ui::k_accent;
+  menu_ui::fill_rect(ren, {tx + 3.f, ty + 3.f, toast_w, toast_h}, menu_ui::k_ink, 0.35f * fade);
+  menu_ui::fill_rect(ren, {tx, ty, toast_w, toast_h}, bg, 0.96f * fade);
+  menu_ui::stroke_rect(ren, {tx, ty, toast_w, toast_h}, border, 0.85f * fade);
+  menu_ui::draw_text_centered(ren, static_cast<float>(win_w) * 0.5f, ty + 8.f, line1.c_str(), ink,
+                              fade);
   if (!line2.empty()) {
     menu_ui::draw_text_centered(ren, static_cast<float>(win_w) * 0.5f, ty + 24.f, line2.c_str(),
-                                menu_ui::k_hint);
+                                menu_ui::k_hint, fade);
   }
 }
 
 void center_on_hex(View* v, HexCoord h, int win_w, int win_h) {
   float const wx = axial_to_world_x(h);
   float const wy = axial_to_world_y(h);
-  v->offset_x = static_cast<float>(win_w) * 0.5f - wx * v->scale;
-  v->offset_y = static_cast<float>(win_h) * 0.5f - wy * v->scale;
+  float const map_cx = static_cast<float>(win_w) * 0.5f;
+  float const map_cy =
+      k_top_bar_h + (static_cast<float>(win_h) - k_top_bar_h - k_footer_bar_h) * 0.5f;
+  v->offset_x = map_cx - wx * v->scale;
+  v->offset_y = map_cy - wy * v->scale;
   clamp_view(v, win_w, win_h);
 }
 
@@ -2407,7 +4834,8 @@ bool nudge_move_cursor(GameSession const& session, GuiState* gui, std::optional<
 [[nodiscard]] bool try_follow_projected_path(GameSession& session, Unit const& u, HexCoord dest);
 
 bool commit_move_command(GameSession& session, GuiState* gui, std::optional<int>* selected_unit_id,
-                         std::optional<HexCoord> hovered_hex, View* v, int win_w, int win_h) {
+                         std::optional<int>* selected_city_id, std::optional<HexCoord> hovered_hex,
+                         View* v, int win_w, int win_h) {
   (void)v;
   (void)win_w;
   (void)win_h;
@@ -2431,15 +4859,16 @@ bool commit_move_command(GameSession& session, GuiState* gui, std::optional<int>
     gui->move_command_mode = false;
     gui->move_cursor.reset();
     gui->move_cursor_locked = false;
-    set_toast(gui, "Move queued.", 2200);
-    maybe_auto_advance_unit_sdl(session, gui, v, selected_unit_id, win_w, win_h);
+    present_action_feedback(gui, "Move queued.", 2200);
+    maybe_auto_advance_action_queue_sdl(session, gui, v, selected_unit_id, selected_city_id, win_w,
+                                        win_h);
     return true;
   }
   return false;
 }
 
 void cycle_next_unit(GameSession& session, std::optional<int>* selected_unit_id, View* v, int win_w,
-                     int win_h, GuiState* gui) {
+                     int win_h, GuiState* gui, std::optional<int>* selected_city_id) {
   int const seat = session.current_player().seat;
   std::vector<Unit const*> mine;
   for (Unit const& u : session.units()) {
@@ -2500,6 +4929,9 @@ void cycle_next_unit(GameSession& session, std::optional<int>* selected_unit_id,
   }
   if (pick != nullptr) {
     *selected_unit_id = pick->id();
+    if (selected_city_id != nullptr) {
+      selected_city_id->reset();
+    }
     gui->move_command_mode = false;
     gui->move_cursor.reset();
     gui->move_cursor_locked = false;
@@ -2508,7 +4940,7 @@ void cycle_next_unit(GameSession& session, std::optional<int>* selected_unit_id,
 }
 
 void cycle_prev_unit(GameSession& session, std::optional<int>* selected_unit_id, View* v, int win_w,
-                     int win_h, GuiState* gui) {
+                     int win_h, GuiState* gui, std::optional<int>* selected_city_id) {
   int const seat = session.current_player().seat;
   std::vector<Unit const*> mine;
   for (Unit const& u : session.units()) {
@@ -2569,6 +5001,9 @@ void cycle_prev_unit(GameSession& session, std::optional<int>* selected_unit_id,
   }
   if (pick != nullptr) {
     *selected_unit_id = pick->id();
+    if (selected_city_id != nullptr) {
+      selected_city_id->reset();
+    }
     gui->move_command_mode = false;
     gui->move_cursor.reset();
     gui->move_cursor_locked = false;
@@ -2587,14 +5022,22 @@ void on_skip_action(GameSession& session, GuiState* gui, std::optional<int>* sel
     if (u.has_value() && u->owner_seat() == session.current_player().seat) {
       if (gui->skipped_units.count(u->id())) {
         gui->skipped_units.erase(u->id());
+        present_action_feedback(gui, "Unit unskipped for this turn.", 2200);
       } else if (u->moves_remaining() > 0) {
         gui->skipped_units.insert(u->id());
+        present_action_feedback(gui, "Unit skipped for this turn.", 2200);
+        if (gui->auto_focus_next_unit) {
+          cycle_next_unit(session, selected_unit_id, v, win_w, win_h, gui, selected_city_id);
+        }
+      } else {
+        maybe_auto_advance_action_queue_sdl(session, gui, v, selected_unit_id, selected_city_id,
+                                            win_w, win_h);
       }
       return;
     }
   }
   std::optional<int> before = *selected_unit_id;
-  cycle_next_unit(session, selected_unit_id, v, win_w, win_h, gui);
+  cycle_next_unit(session, selected_unit_id, v, win_w, win_h, gui, selected_city_id);
   std::optional<int> after = *selected_unit_id;
   if (before == after) {
     selected_city_id->reset();
@@ -2629,31 +5072,42 @@ void try_found_city_sdl(GameSession& session, std::optional<int>* selected_unit_
   }
 }
 
+[[nodiscard]] bool sdl_unit_needs_manual_orders(GameSession const& session, GuiState const& gui,
+                                              Unit const& u) {
+  if (session.is_over() || session.current_player().computer) {
+    return false;
+  }
+  int const seat = session.current_player().seat;
+  if (u.owner_seat() != seat) {
+    return false;
+  }
+  if (u.sleeping() || u.auto_explore()) {
+    return false;
+  }
+  if (gui.skipped_units.count(u.id()) != 0) {
+    return false;
+  }
+  if (u.moves_remaining() <= 0) {
+    return false;
+  }
+  return session.planned_route_for(u.id()).empty();
+}
+
 [[nodiscard]] bool sdl_has_pending_manual_unit_orders(GameSession const& session,
                                                      GuiState const& gui) {
+  return count_units_needing_manual_orders(session, gui) > 0;
+}
+
+[[nodiscard]] int count_units_needing_manual_orders(GameSession const& session,
+                                                    GuiState const& gui) {
+  int count = 0;
   int const seat = session.current_player().seat;
   for (Unit const& u : session.units()) {
-    if (u.owner_seat() != seat) {
-      continue;
+    if (u.owner_seat() == seat && sdl_unit_needs_manual_orders(session, gui, u)) {
+      ++count;
     }
-    if (u.sleeping()) {
-      continue;
-    }
-    if (u.auto_explore()) {
-      continue;
-    }
-    if (gui.skipped_units.count(u.id()) != 0) {
-      continue;
-    }
-    if (u.moves_remaining() <= 0) {
-      continue;
-    }
-    if (!session.planned_route_for(u.id()).empty()) {
-      continue;
-    }
-    return true;
   }
-  return false;
+  return count;
 }
 
 [[nodiscard]] bool sdl_player_has_city_without_production(GameSession const& session) {
@@ -2747,10 +5201,8 @@ bool apply_city_production_choice(GameSession& session, GuiState* gui, View* vie
   if (sdl_player_has_city_without_production(session)) {
     select_first_city_missing_production_sdl(session, view, sel_unit, sel_city, win_w, win_h);
   } else {
-    pick_default_human_unit(session, sel_unit);
-    if (sel_unit->has_value()) {
-      cycle_next_unit(session, sel_unit, view, win_w, win_h, gui);
-    }
+    sel_unit->reset();
+    cycle_next_unit(session, sel_unit, view, win_w, win_h, gui, sel_city);
   }
   set_toast(gui, std::string("Building ") + tack::strat::unit_kind_display_name(kind), 2800);
   append_event_log(gui, "Building " + std::string(tack::strat::unit_kind_display_name(kind)) + ".");
@@ -2797,13 +5249,14 @@ bool try_handle_unit_inspector_click(GameSession& session, GuiState* gui, View* 
     return true;
   }
 
-  auto toast_optional = [&](std::optional<std::string> const& msg) {
+  auto feedback_optional = [&](std::optional<std::string> const& msg,
+                               std::optional<HexCoord> combat_flash = std::nullopt) {
     if (msg.has_value()) {
-      set_toast(gui, *msg, 4800);
+      present_action_feedback(gui, *msg, 4800, combat_flash);
     }
   };
   auto finish_unit_action = [&]() {
-    maybe_auto_advance_unit_sdl(session, gui, view, sel_unit, win_w, win_h);
+    maybe_auto_advance_action_queue_sdl(session, gui, view, sel_unit, sel_city, win_w, win_h);
   };
 
   if (screen_point_in_rect(mx, my, layout.skip_btn)) {
@@ -2812,7 +5265,7 @@ bool try_handle_unit_inspector_click(GameSession& session, GuiState* gui, View* 
   }
   if (screen_point_in_rect(mx, my, layout.fortify_btn) && u->moves_remaining() > 0) {
     if (session.fortify_unit(layout.unit_id)) {
-      set_toast(gui, "Fortified.", 2200);
+      present_action_feedback(gui, "Fortified.", 2200);
     }
     finish_unit_action();
     return true;
@@ -2820,13 +5273,13 @@ bool try_handle_unit_inspector_click(GameSession& session, GuiState* gui, View* 
   if (screen_point_in_rect(mx, my, layout.explore_btn)) {
     bool const on = !u->auto_explore();
     session.set_unit_auto_explore(layout.unit_id, on);
-    set_toast(gui, on ? "Auto-explore on." : "Auto-explore off.", 2400);
+    present_action_feedback(gui, on ? "Auto-explore on." : "Auto-explore off.", 2400);
     return true;
   }
   if (screen_point_in_rect(mx, my, layout.sleep_btn)) {
     bool const on = !u->sleeping();
     session.set_unit_sleeping(layout.unit_id, on);
-    set_toast(gui, on ? "Unit sleeping until manually woken." : "Unit awake.", 2800);
+    present_action_feedback(gui, on ? "Unit sleeping until manually woken." : "Unit awake.", 2800);
     return true;
   }
   if (layout.show_found_city && screen_point_in_rect(mx, my, layout.found_city_btn)) {
@@ -2835,37 +5288,38 @@ bool try_handle_unit_inspector_click(GameSession& session, GuiState* gui, View* 
   }
   if (layout.show_cultivate && screen_point_in_rect(mx, my, layout.cultivate_btn) &&
       u->moves_remaining() > 0) {
-    toast_optional(session.try_cultivate_tile(layout.unit_id));
+    feedback_optional(session.try_cultivate_tile(layout.unit_id));
     finish_unit_action();
     return true;
   }
   if (layout.show_clear_forest && screen_point_in_rect(mx, my, layout.clear_forest_btn) &&
       u->moves_remaining() > 0) {
-    toast_optional(session.try_clear_forest(layout.unit_id));
+    feedback_optional(session.try_clear_forest(layout.unit_id));
     finish_unit_action();
     return true;
   }
   if (layout.show_build_farm && screen_point_in_rect(mx, my, layout.build_farm_btn) &&
       u->moves_remaining() > 0) {
-    toast_optional(session.try_build_farm_improvement(layout.unit_id));
+    feedback_optional(session.try_build_farm_improvement(layout.unit_id));
     finish_unit_action();
     return true;
   }
   if (layout.show_build_mine && screen_point_in_rect(mx, my, layout.build_mine_btn) &&
       u->moves_remaining() > 0) {
-    toast_optional(session.try_build_mine_improvement(layout.unit_id));
+    feedback_optional(session.try_build_mine_improvement(layout.unit_id));
     finish_unit_action();
     return true;
   }
   if (layout.show_rebase && screen_point_in_rect(mx, my, layout.rebase_btn)) {
-    toast_optional(session.try_rebase_hunting_party(layout.unit_id));
+    feedback_optional(session.try_rebase_hunting_party(layout.unit_id));
     finish_unit_action();
     return true;
   }
   if (layout.show_hunt && screen_point_in_rect(mx, my, layout.hunt_btn) &&
       u->moves_remaining() > 0) {
     if (auto beast = session.wild_animal_at(u->coord()); beast.has_value()) {
-      toast_optional(session.try_hunt_wildlife(layout.unit_id, beast->id(), u->coord()));
+      feedback_optional(session.try_hunt_wildlife(layout.unit_id, beast->id(), u->coord()),
+                        u->coord());
     }
     finish_unit_action();
     return true;
@@ -2950,12 +5404,11 @@ void on_primary_action_sdl(GameSession& session, GuiState* gui, View* view,
   }
 
   if (gui->move_command_mode) {
-    if (!commit_move_command(session, gui, sel_unit, hovered_hex, view, win_w, win_h)) {
-      set_toast(gui,
-                "No valid move to commit. Nudge the cursor, hover a tile, or press Esc to leave "
-                "move mode.",
-                4800);
+    if (commit_move_command(session, gui, sel_unit, sel_city, hovered_hex, view, win_w, win_h)) {
+      return;
     }
+    clear_move_command_mode(gui);
+    advance_hud_action_queue(session, gui, view, sel_unit, sel_city, win_w, win_h);
     return;
   }
 
@@ -2976,10 +5429,17 @@ void on_primary_action_sdl(GameSession& session, GuiState* gui, View* view,
       return;
     }
     if (!session.planned_route_for(**sel_unit).empty()) {
+      if (u->moves_remaining() <= 0) {
+        cycle_next_unit(session, sel_unit, view, win_w, win_h, gui, sel_city);
+        maybe_auto_advance_action_queue_sdl(session, gui, view, sel_unit, sel_city, win_w, win_h);
+        return;
+      }
       if (session.follow_planned_route(**sel_unit)) {
         set_toast(gui, "Following route.", 2200);
+      } else {
+        set_toast(gui, "Route blocked - move manually or clear with Backspace.", 4200);
       }
-      maybe_auto_advance_unit_sdl(session, gui, view, sel_unit, win_w, win_h);
+      maybe_auto_advance_action_queue_sdl(session, gui, view, sel_unit, sel_city, win_w, win_h);
       return;
     }
     gui->move_command_mode = true;
@@ -2997,7 +5457,7 @@ void on_primary_action_sdl(GameSession& session, GuiState* gui, View* view,
     }
   }
 
-  cycle_next_unit(session, sel_unit, view, win_w, win_h, gui);
+  cycle_next_unit(session, sel_unit, view, win_w, win_h, gui, sel_city);
 }
 
 bool try_handle_bottom_action_bar_click(GameSession& session, GuiState* gui, View* view,
@@ -3008,20 +5468,9 @@ bool try_handle_bottom_action_bar_click(GameSession& session, GuiState* gui, Vie
   if (!layout.visible) {
     return false;
   }
-  if (screen_point_in_rect(mx, my, layout.primary_btn)) {
-    if (layout.primary.enabled) {
-      on_primary_action_sdl(session, gui, view, sel_unit, sel_city, hovered_hex, win_w, win_h, flow);
-    } else if (!layout.primary.detail.empty()) {
-      set_toast(gui, layout.primary.detail, 3600);
-    }
-    return true;
-  }
-  if (screen_point_in_rect(mx, my, layout.end_turn_btn)) {
-    if (layout.end_turn_enabled) {
-      do_end_turn_sdl(session, gui, view, sel_unit, sel_city, win_w, win_h, flow);
-    } else {
-      set_toast(gui, layout.end_turn_label, 3600);
-    }
+  if (screen_point_in_rect(mx, my, layout.action_hit)) {
+    on_hud_action_click(session, gui, view, sel_unit, sel_city, layout.action, hovered_hex, win_w,
+                        win_h, flow);
     return true;
   }
   return false;
@@ -3034,7 +5483,7 @@ void do_end_turn_sdl(GameSession& session, GuiState* gui, View* view,
     return;
   }
   if (sdl_has_pending_manual_unit_orders(session, *gui)) {
-    cycle_next_unit(session, selected_unit_id, view, win_w, win_h, gui);
+    cycle_next_unit(session, selected_unit_id, view, win_w, win_h, gui, selected_city_id);
     set_toast(gui, "Units still need orders. Skipping to next unit.", 4200);
     return;
   }
@@ -3078,7 +5527,7 @@ void handle_direction_key(GameSession& session, GuiState* gui, std::optional<int
   pan_java_pixels(v, pan_dx, pan_dy, win_w, win_h);
 }
 
-[[nodiscard]] std::optional<std::vector<HexCoord>> projected_path_to(GameSession& session,
+[[nodiscard]] std::optional<std::vector<HexCoord>> projected_path_to(GameSession const& session,
                                                                      Unit const& unit,
                                                                      HexCoord dest) {
   if (unit.coord() == dest) {
@@ -3166,6 +5615,40 @@ void handle_direction_key(GameSession& session, GuiState* gui, std::optional<int
   return path;
 }
 
+[[nodiscard]] int projected_path_turns(Unit const& unit, std::vector<HexCoord> const& path,
+                                       GameSession const& session) {
+  if (path.size() < 2) {
+    return 0;
+  }
+  int cost = 0;
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    cost += session.movement_cost_for_step(unit, path[i]);
+  }
+  int const per_turn = tack::strat::unit_movement(unit.kind());
+  int const first_turn_moves = std::max(1, unit.moves_remaining());
+  if (cost <= first_turn_moves) {
+    return 1;
+  }
+  return 1 + (cost - first_turn_moves + per_turn - 1) / per_turn;
+}
+
+[[nodiscard]] bool try_queue_projected_path(GameSession& session, Unit const& u, HexCoord dest,
+                                            std::string* feedback = nullptr) {
+  auto path = projected_path_to(session, u, dest);
+  if (!path.has_value() || path->size() < 2) {
+    return false;
+  }
+  if (!session.assign_planned_route(u.id(), *path)) {
+    return false;
+  }
+  if (feedback != nullptr) {
+    int const turns = projected_path_turns(u, *path, session);
+    *feedback = "Route queued (~" + std::to_string(turns) + " turn" + (turns == 1 ? "" : "s") +
+                  "). Press P or click to follow.";
+  }
+  return true;
+}
+
 [[nodiscard]] bool try_follow_projected_path(GameSession& session, Unit const& u, HexCoord dest) {
   auto path = projected_path_to(session, u, dest);
   if (!path.has_value() || path->size() < 2) {
@@ -3180,9 +5663,10 @@ void handle_direction_key(GameSession& session, GuiState* gui, std::optional<int
 }
 
 [[nodiscard]] bool try_selected_unit_interact(GameSession& session, GuiState* gui,
-                                              std::optional<int>& selected_unit_id, HexCoord h,
+                                              std::optional<int>& selected_unit_id,
+                                              std::optional<int>& selected_city_id, HexCoord h,
                                               std::unordered_set<HexCoord> const& visible,
-                                              View* v, int win_w, int win_h) {
+                                              View* v, int win_w, int win_h, bool queue_only) {
   if (!selected_unit_id.has_value()) {
     return false;
   }
@@ -3201,32 +5685,48 @@ void handle_direction_key(GameSession& session, GuiState* gui, std::optional<int
       unit_here->owner_seat() != cur_seat) {
     if (auto msg = session.try_attack(me.id(), h)) {
       if (gui != nullptr) {
-        append_event_log(gui, *msg);
-        set_toast(gui, *msg, 4800);
+        present_action_feedback(gui, *msg, 4800, h);
       }
       if (!session.unit_by_id(*selected_unit_id).has_value()) {
         selected_unit_id.reset();
       } else if (gui != nullptr && v != nullptr) {
-        maybe_auto_advance_unit_sdl(session, gui, v, &selected_unit_id, win_w, win_h);
+        maybe_auto_advance_action_queue_sdl(session, gui, v, &selected_unit_id, &selected_city_id,
+                                            win_w, win_h);
       }
     }
     return true;
   }
 
   if (me.coord().distance_to(h) > 1) {
-    static_cast<void>(try_follow_projected_path(session, me, h));
-  } else {
+    if (queue_only) {
+      std::string msg;
+      if (try_queue_projected_path(session, me, h, &msg)) {
+        if (gui != nullptr) {
+          present_action_feedback(gui, msg, 3600);
+        }
+      } else if (gui != nullptr) {
+        set_toast(gui, "Cannot queue a route to that tile.", 3200);
+      }
+    } else if (try_follow_projected_path(session, me, h)) {
+      if (gui != nullptr) {
+        present_action_feedback(gui, "Move queued.", 2200);
+      }
+    } else if (gui != nullptr) {
+      set_toast(gui, "No path to that tile.", 3200);
+    }
+  } else if (!queue_only) {
     static_cast<void>(session.try_move_unit(me.id(), h));
   }
-  if (gui != nullptr && v != nullptr) {
-    maybe_auto_advance_unit_sdl(session, gui, v, &selected_unit_id, win_w, win_h);
+  if (!queue_only && gui != nullptr && v != nullptr) {
+    maybe_auto_advance_action_queue_sdl(session, gui, v, &selected_unit_id, &selected_city_id,
+                                        win_w, win_h);
   }
   return true;
 }
 
 void handle_left_click(GameSession& session, View* v, GuiState* gui,
                        std::optional<int>& selected_unit_id, std::optional<int>& selected_city_id,
-                       float sx, float sy, int win_w, int win_h) {
+                       float sx, float sy, int win_w, int win_h, bool shift_queue_only) {
   if (session.is_over()) {
     return;
   }
@@ -3235,11 +5735,26 @@ void handle_left_click(GameSession& session, View* v, GuiState* gui,
     return;
   }
 
+  if (gui != nullptr) {
+    Uint64 const now = SDL_GetTicks();
+    bool const double_click = gui->last_map_click_hex.has_value() && *gui->last_map_click_hex == h &&
+                              now - gui->last_map_click_ticks < 400;
+    gui->last_map_click_ticks = now;
+    gui->last_map_click_hex = h;
+    if (double_click) {
+      center_on_hex(v, h, win_w, win_h);
+      present_action_feedback(gui, "Centered on (" + std::to_string(h.q) + "," + std::to_string(h.r) + ").",
+                              1800);
+      return;
+    }
+  }
+
   int const cur_seat = session.current_player().seat;
   if (gui != nullptr && gui->move_command_mode && selected_unit_id.has_value()) {
     auto u = session.unit_by_id(*selected_unit_id);
     if (u.has_value() && u->owner_seat() == cur_seat) {
-      if (commit_move_command(session, gui, &selected_unit_id, h, v, win_w, win_h)) {
+      if (commit_move_command(session, gui, &selected_unit_id, &selected_city_id, h, v, win_w,
+                              win_h)) {
         return;
       }
     }
@@ -3248,13 +5763,16 @@ void handle_left_click(GameSession& session, View* v, GuiState* gui,
   auto visited = session.visited_for(cur_seat);
 
   if (!visited.count(h)) {
-    static_cast<void>(
-        try_selected_unit_interact(session, gui, selected_unit_id, h, visible, v, win_w, win_h));
+    static_cast<void>(try_selected_unit_interact(session, gui, selected_unit_id, selected_city_id,
+                                                 h, visible, v, win_w, win_h, shift_queue_only));
     return;
   }
 
   auto city_here = session.city_at(h);
   if (city_here.has_value() && city_here->owner_seat() == cur_seat) {
+    if (gui != nullptr) {
+      clear_move_command_mode(gui);
+    }
     selected_city_id = city_here->id();
     selected_unit_id.reset();
     return;
@@ -3262,12 +5780,16 @@ void handle_left_click(GameSession& session, View* v, GuiState* gui,
 
   auto unit_here = session.unit_at(h);
   if (unit_here.has_value() && unit_here->owner_seat() == cur_seat) {
+    if (gui != nullptr) {
+      clear_move_command_mode(gui);
+    }
     selected_unit_id = unit_here->id();
     selected_city_id.reset();
     return;
   }
 
-  if (try_selected_unit_interact(session, gui, selected_unit_id, h, visible, v, win_w, win_h)) {
+  if (try_selected_unit_interact(session, gui, selected_unit_id, selected_city_id, h, visible, v,
+                                 win_w, win_h, shift_queue_only)) {
     return;
   }
 
@@ -3276,23 +5798,22 @@ void handle_left_click(GameSession& session, View* v, GuiState* gui,
 }
 
 void paint_vertical_background(SDL_Renderer* ren, int w, int h) {
-  for (int y = 0; y < h; ++y) {
-    float t = h <= 1 ? 0.f : static_cast<float>(y) / static_cast<float>(h - 1);
-    float r = (0x08 / 255.f) * (1 - t) + (0x14 / 255.f) * t;
-    float g = (0x14 / 255.f) * (1 - t) + (0x24 / 255.f) * t;
-    float b = (0x24 / 255.f) * (1 - t) + (0x38 / 255.f) * t;
-    SDL_SetRenderDrawColorFloat(ren, r, g, b, 1.f);
-    SDL_RenderLine(ren, 0.f, static_cast<float>(y), static_cast<float>(w), static_cast<float>(y));
-  }
+  // Solid fill avoids horizontal banding from stepped gradient rects.
+  menu_ui::fill_rect(ren, {0.f, 0.f, static_cast<float>(w), static_cast<float>(h)},
+                     rgb_u8(0x0e, 0x1c, 0x2c), 1.f);
 }
 
-[[nodiscard]] std::string tile_hover_summary(GameSession const& session, HexCoord h, int seat) {
+[[nodiscard]] std::string tile_hover_summary(GameSession const& session, HexCoord h, int seat,
+                                             std::optional<int> selected_unit_id = std::nullopt) {
   if (!session.map().contains(h)) {
     return {};
   }
-  if (!session.visited_for(seat).count(h)) {
+  auto const visited = session.visited_for(seat);
+  auto const visible = session.visible_for(seat);
+  if (!visited.count(h)) {
     return std::string("Unexplored  (") + std::to_string(h.q) + "," + std::to_string(h.r) + ")";
   }
+  bool const in_sight = visible.count(h);
   Terrain const t = session.terrain_effective_at(h);
   std::string s = "(terrain)";
   switch (t) {
@@ -3319,15 +5840,18 @@ void paint_vertical_background(SDL_Renderer* ren, int w, int h) {
       break;
   }
   s += "  (" + std::to_string(h.q) + "," + std::to_string(h.r) + ")";
+  if (!in_sight) {
+    s += "  (fog)";
+  }
   if (auto city = session.city_at(h)) {
     s += "  City " + city->name();
   }
   if (auto u = session.unit_at(h)) {
-    if (u->owner_seat() == seat || session.visible_for(seat).count(h)) {
+    if (u->owner_seat() == seat || in_sight) {
       s += "  " + std::string(tack::strat::unit_kind_display_name(u->kind()));
     }
   }
-  if (session.visible_for(seat).count(h)) {
+  if (in_sight) {
     if (auto wa = session.wild_animal_at(h); wa.has_value() && !wa->is_dead()) {
       s += "  Wildlife: ";
       s += tack::strat::wild_animal_kind_label(wa->kind());
@@ -3345,6 +5869,11 @@ void paint_vertical_background(SDL_Renderer* ren, int w, int h) {
       s += "  Terr ";
       s += std::to_string(*terr);
     }
+    std::string claim_dbg = session.claim_debug_at(h);
+    if (claim_dbg.size() > 7) {
+      s += "  ";
+      s += menu_ui::truncate_line(std::move(claim_dbg), 42);
+    }
     s += "  ";
     s += std::to_string(session.tile_food_yield(h));
     s += "f/";
@@ -3353,7 +5882,63 @@ void paint_vertical_background(SDL_Renderer* ren, int w, int h) {
     s += std::to_string(session.tile_gold_yield(h));
     s += "g";
   }
+  if (selected_unit_id.has_value() && !session.is_over() &&
+      session.current_player().seat == seat) {
+    if (auto su = session.unit_by_id(*selected_unit_id);
+        su.has_value() && su->owner_seat() == seat && su->coord() != h) {
+      if (auto path = projected_path_to(session, *su, h); path.has_value() && path->size() >= 2) {
+        int const turns = projected_path_turns(*su, *path, session);
+        s += "  Route ~";
+        s += std::to_string(turns);
+        s += " turn";
+        if (turns != 1) {
+          s += "s";
+        }
+      } else {
+        for (HexCoord const lc : session.legal_moves(*su)) {
+          if (lc == h) {
+            s += "  Route ~1 turn";
+            break;
+          }
+        }
+      }
+    }
+  }
   return s;
+}
+
+void update_map_hover_from_screen(GameSession const& session, View const& v, float mx, float my,
+                                  int seat, std::optional<int> selected_unit_id, GuiState const* gui,
+                                  std::optional<HexCoord>* hovered_hex, std::string* hover_line) {
+  if (hovered_hex == nullptr || hover_line == nullptr) {
+    return;
+  }
+  HexCoord const hh = pick_hex_at_screen(session, v, mx, my);
+  if (!session.map().contains(hh)) {
+    hovered_hex->reset();
+    hover_line->clear();
+    return;
+  }
+  *hovered_hex = hh;
+  *hover_line = tile_hover_summary(session, hh, seat, selected_unit_id);
+  if (!selected_unit_id.has_value() || session.is_over() || session.current_player().computer) {
+    return;
+  }
+  auto const visited = session.visited_for(seat);
+  if (auto u = session.unit_by_id(*selected_unit_id);
+      u.has_value() && u->kind() == UnitKind::SETTLER && u->owner_seat() == seat && !u->is_dead() &&
+      visited.count(hh)) {
+    if (std::string preview = sdl_settle_preview_short(session, hh, seat); !preview.empty()) {
+      *hover_line += "\n";
+      *hover_line += menu_ui::truncate_line(std::move(preview), 92);
+    }
+  }
+  if (gui != nullptr && gui->show_settler_lens) {
+    if (SettlerLensHint const* hint = settler_lens_hint_at(*gui, hh)) {
+      *hover_line += "\n";
+      *hover_line += settler_lens_hover_line(*hint);
+    }
+  }
 }
 
 bool handle_java_key_down(SDL_Event const& e, GameSession& session, GuiState* gui, View* view,
@@ -3423,12 +6008,11 @@ bool handle_java_key_down(SDL_Event const& e, GameSession& session, GuiState* gu
       return true;
     }
     if (gui->move_command_mode) {
-      gui->move_command_mode = false;
-      gui->move_cursor.reset();
-      gui->move_cursor_locked = false;
+      clear_move_command_mode(gui);
       return true;
     }
     if (sel_unit->has_value() || sel_city->has_value()) {
+      clear_move_command_mode(gui);
       sel_unit->reset();
       sel_city->reset();
       return true;
@@ -3461,16 +6045,10 @@ bool handle_java_key_down(SDL_Event const& e, GameSession& session, GuiState* gu
   }
 
   if (enter_pressed) {
-    if (gui->move_command_mode) {
-      if (!commit_move_command(session, gui, sel_unit, hovered_hex, view, win_w, win_h)) {
-        set_toast(gui,
-                  "No valid move to commit. Nudge the cursor, hover a tile, or press Esc to leave "
-                  "move mode.",
-                  4800);
-      }
-    } else {
-      do_end_turn_sdl(session, gui, view, sel_unit, sel_city, win_w, win_h, flow);
-    }
+    PrimaryActionState const act =
+        compute_primary_action_state(session, *gui, *sel_unit, *sel_city);
+    on_hud_action_click(session, gui, view, sel_unit, sel_city, act, hovered_hex, win_w, win_h,
+                        flow);
     return true;
   }
 
@@ -3506,8 +6084,8 @@ bool handle_java_key_down(SDL_Event const& e, GameSession& session, GuiState* gu
         fit_map_to_window(view, win_w, win_h);
       } else if (sel_unit->has_value()) {
         if (session.fortify_unit(**sel_unit)) {
-          set_toast(gui, "Fortified.", 2200);
-          maybe_auto_advance_unit_sdl(session, gui, view, sel_unit, win_w, win_h);
+          present_action_feedback(gui, "Fortified.", 2200);
+          maybe_auto_advance_action_queue_sdl(session, gui, view, sel_unit, sel_city, win_w, win_h);
         }
       }
       return true;
@@ -3533,17 +6111,17 @@ bool handle_java_key_down(SDL_Event const& e, GameSession& session, GuiState* gu
       return true;
     case SDLK_TAB:
       if (shift) {
-        cycle_prev_unit(session, sel_unit, view, win_w, win_h, gui);
+        cycle_prev_unit(session, sel_unit, view, win_w, win_h, gui, sel_city);
       } else {
-        cycle_next_unit(session, sel_unit, view, win_w, win_h, gui);
+        cycle_next_unit(session, sel_unit, view, win_w, win_h, gui, sel_city);
       }
       return true;
     case SDLK_N:
     case SDLK_PERIOD:
-      cycle_next_unit(session, sel_unit, view, win_w, win_h, gui);
+      cycle_next_unit(session, sel_unit, view, win_w, win_h, gui, sel_city);
       return true;
     case SDLK_COMMA:
-      cycle_prev_unit(session, sel_unit, view, win_w, win_h, gui);
+      cycle_prev_unit(session, sel_unit, view, win_w, win_h, gui, sel_city);
       return true;
     case SDLK_HOME:
       if (!session.is_over() && !session.current_player().computer) {
@@ -3599,11 +6177,24 @@ bool handle_java_key_down(SDL_Event const& e, GameSession& session, GuiState* gu
         }
       }
       return true;
-    case SDLK_P:
-      on_primary_action_sdl(session, gui, view, sel_unit, sel_city, hovered_hex, win_w, win_h, flow);
+    case SDLK_P: {
+      PrimaryActionState const act =
+          compute_primary_action_state(session, *gui, *sel_unit, *sel_city);
+      on_hud_action_click(session, gui, view, sel_unit, sel_city, act, hovered_hex, win_w, win_h,
+                          flow);
       return true;
+    }
     case SDLK_U:
       toggle_auto_focus_next_unit(gui);
+      return true;
+    case SDLK_H:
+      toggle_settler_lens(gui);
+      return true;
+    case SDLK_W:
+      toggle_weather_legend(gui);
+      return true;
+    case SDLK_L:
+      toggle_claim_legend(gui);
       return true;
     default:
       break;
@@ -3611,28 +6202,18 @@ bool handle_java_key_down(SDL_Event const& e, GameSession& session, GuiState* gu
   return false;
 }
 
-void draw_tile_hover_text(SDL_Renderer* ren, float x, float y, std::string const& full, int win_w) {
-  std::vector<std::string> lines;
-  for (std::size_t pos = 0; pos < full.size();) {
-    std::size_t const next = full.find('\n', pos);
-    if (next == std::string::npos) {
-      lines.push_back(full.substr(pos));
-      break;
-    }
-    lines.push_back(full.substr(pos, next - pos));
-    pos = next + 1;
-  }
+void draw_tile_hover_text(SDL_Renderer* ren, float x, float y, std::string const& full,
+                          float wrap_w) {
+  std::vector<std::string> const lines = tile_hover_lines(full, wrap_w);
   if (lines.empty()) {
     return;
   }
-  int const budget = std::max(28, (win_w - 28) / 7);
-  for (std::string& line : lines) {
-    if (static_cast<int>(line.size()) > budget) {
-      line = menu_ui::truncate_line(std::move(line), static_cast<std::size_t>(budget));
-    }
+  float panel_content_w = 0.f;
+  for (std::string const& line : lines) {
+    panel_content_w = std::max(panel_content_w, menu_ui::text_width(line.c_str()));
   }
-  float const panel_w =
-      std::min(static_cast<float>(win_w) - 20.f, 14.f * static_cast<float>(budget) + 16.f);
+  panel_content_w = std::min(wrap_w, panel_content_w);
+  float const panel_w = panel_content_w + 16.f;
   float const panel_h = 8.f + 14.f * static_cast<float>(lines.size());
   SDL_FRect panel{x - 4.f, y - 4.f, panel_w, panel_h};
   menu_ui::fill_rect(ren, panel, rgb_u8(0x06, 0x0a, 0x12), 0.92f);
@@ -3651,42 +6232,109 @@ void draw_tile_hover_text(SDL_Renderer* ren, float x, float y, std::string const
           k_top_bar_h + k_minimap_pad, k_minimap_w, k_minimap_h};
 }
 
+struct MinimapPlot {
+  float x = 0.f;
+  float y = 0.f;
+  float w = 0.f;
+  float h = 0.f;
+  float world_min_x = 0.f;
+  float world_min_y = 0.f;
+  float px_per_world = 1.f;
+};
+
+[[nodiscard]] MinimapPlot make_minimap_plot(SDL_FRect const& mm, float bmin_x, float bmin_y,
+                                            float bmax_x, float bmax_y) noexcept {
+  MinimapPlot plot;
+  float const world_w = std::max(1.f, bmax_x - bmin_x);
+  float const world_h = std::max(1.f, bmax_y - bmin_y);
+  float const inner_pad = 8.f;
+  float const inner_w = std::max(1.f, mm.w - inner_pad * 2.f);
+  float const inner_h = std::max(1.f, mm.h - inner_pad * 2.f);
+  float const world_aspect = world_w / world_h;
+  float const inner_aspect = inner_w / inner_h;
+  if (world_aspect >= inner_aspect) {
+    plot.w = inner_w;
+    plot.h = inner_w / world_aspect;
+  } else {
+    plot.h = inner_h;
+    plot.w = inner_h * world_aspect;
+  }
+  plot.x = mm.x + inner_pad + (inner_w - plot.w) * 0.5f;
+  plot.y = mm.y + inner_pad + (inner_h - plot.h) * 0.5f;
+  plot.world_min_x = bmin_x;
+  plot.world_min_y = bmin_y;
+  plot.px_per_world = plot.w / world_w;
+  return plot;
+}
+
+void minimap_plot_to_screen(MinimapPlot const& plot, float wx, float wy, float* sx,
+                            float* sy) noexcept {
+  *sx = plot.x + (wx - plot.world_min_x) * plot.px_per_world;
+  *sy = plot.y + (wy - plot.world_min_y) * plot.px_per_world;
+}
+
+[[nodiscard]] bool minimap_screen_to_world(MinimapPlot const& plot, float sx, float sy, float* wx,
+                                           float* wy) noexcept {
+  if (!screen_point_in_rect(sx, sy, {plot.x, plot.y, plot.w, plot.h})) {
+    return false;
+  }
+  *wx = plot.world_min_x + (sx - plot.x) / plot.px_per_world;
+  *wy = plot.world_min_y + (sy - plot.y) / plot.px_per_world;
+  return true;
+}
+
+void expand_bounds_for_viewport(float* bmin_x, float* bmin_y, float* bmax_x, float* bmax_y,
+                                float vx0, float vy0, float vx1, float vy1) noexcept {
+  *bmin_x = std::min(*bmin_x, std::min(vx0, vx1));
+  *bmin_y = std::min(*bmin_y, std::min(vy0, vy1));
+  *bmax_x = std::max(*bmax_x, std::max(vx0, vx1));
+  *bmax_y = std::max(*bmax_y, std::max(vy0, vy1));
+}
+
 void pan_view_to_world_point(View* v, float wx, float wy, int win_w, int win_h) {
-  v->offset_x = static_cast<float>(win_w) * 0.5f - wx * v->scale;
-  v->offset_y = static_cast<float>(win_h) * 0.5f - wy * v->scale;
+  v->offset_x = map_center_x(win_w) - wx * v->scale;
+  v->offset_y = map_center_y(win_h) - wy * v->scale;
   clamp_view(v, win_w, win_h);
 }
 
 [[nodiscard]] bool handle_minimap_click(GameSession const& session, View* v, float mx, float my,
                                         int win_w, int win_h, float right_ui_margin = 0.f) {
+  (void)session;
   SDL_FRect const mm = minimap_screen_rect(win_w, right_ui_margin);
   if (!screen_point_in_rect(mx, my, mm)) {
     return false;
   }
-  float const inner_pad = 8.f;
-  float const inner_w = mm.w - inner_pad * 2.f;
-  float const inner_h = mm.h - inner_pad * 2.f;
-  if (inner_w <= 1.f || inner_h <= 1.f) {
+  float bmin_x = view_bounds_min_x(*v);
+  float bmin_y = view_bounds_min_y(*v);
+  float bmax_x = view_bounds_max_x(*v);
+  float bmax_y = view_bounds_max_y(*v);
+  float const map_top = k_top_bar_h;
+  float const map_bot = static_cast<float>(win_h) - k_footer_bar_h;
+  float const vx0 = (0.f - v->offset_x) / v->scale;
+  float const vy0 = (map_top - v->offset_y) / v->scale;
+  float const vx1 = (static_cast<float>(win_w) - v->offset_x) / v->scale;
+  float const vy1 = (map_bot - v->offset_y) / v->scale;
+  expand_bounds_for_viewport(&bmin_x, &bmin_y, &bmax_x, &bmax_y, vx0, vy0, vx1, vy1);
+  MinimapPlot const plot = make_minimap_plot(mm, bmin_x, bmin_y, bmax_x, bmax_y);
+  float wx = 0.f;
+  float wy = 0.f;
+  if (!minimap_screen_to_world(plot, mx, my, &wx, &wy)) {
     return false;
   }
-  float const u = std::clamp((mx - mm.x - inner_pad) / inner_w, 0.f, 1.f);
-  float const t = std::clamp((my - mm.y - inner_pad) / inner_h, 0.f, 1.f);
-  float const world_w = v->world_max_x - v->world_min_x;
-  float const world_h = v->world_max_y - v->world_min_y;
-  if (world_w <= 1.f || world_h <= 1.f) {
-    return false;
-  }
-  pan_view_to_world_point(v, v->world_min_x + u * world_w, v->world_min_y + t * world_h, win_w,
-                          win_h);
+  pan_view_to_world_point(v, wx, wy, win_w, win_h);
   return true;
 }
 
 void draw_minimap(SDL_Renderer* ren, GameSession const& session, View const& v, int cur_seat,
-                  int win_w, int win_h, float right_ui_margin = 0.f) {
+                  int win_w, int win_h, float right_ui_margin = 0.f,
+                  std::optional<int> selected_unit_id = std::nullopt,
+                  bool minimap_tint_own_claims_only = false) {
   SDL_FRect const mm = minimap_screen_rect(win_w, right_ui_margin);
-  float const world_w = v.world_max_x - v.world_min_x;
-  float const world_h = v.world_max_y - v.world_min_y;
-  if (world_w <= 1.f || world_h <= 1.f) {
+  float bmin_x = view_bounds_min_x(v);
+  float bmin_y = view_bounds_min_y(v);
+  float bmax_x = view_bounds_max_x(v);
+  float bmax_y = view_bounds_max_y(v);
+  if (bmax_x - bmin_x <= 1.f || bmax_y - bmin_y <= 1.f) {
     return;
   }
 
@@ -3697,16 +6345,22 @@ void draw_minimap(SDL_Renderer* ren, GameSession const& session, View const& v, 
   SDL_RenderFillRect(ren, &mm);
   SDL_SetRenderDrawColorFloat(ren, 0.35f, 0.48f, 0.62f, 0.85f);
   SDL_RenderRect(ren, &mm);
+  menu_ui::draw_text(ren, mm.x + 6.f, mm.y + 3.f, "Map", menu_ui::k_muted, 0.88f);
 
-  float const inner_pad = 8.f;
-  float const inner_x = mm.x + inner_pad;
-  float const inner_y = mm.y + inner_pad;
-  float const inner_w = mm.w - inner_pad * 2.f;
-  float const inner_h = mm.h - inner_pad * 2.f;
+  float const map_top = k_top_bar_h;
+  float const map_bot = static_cast<float>(win_h) - k_footer_bar_h;
+  float const vx0 = (0.f - v.offset_x) / v.scale;
+  float const vy0 = (map_top - v.offset_y) / v.scale;
+  float const vx1 = (static_cast<float>(win_w) - v.offset_x) / v.scale;
+  float const vy1 = (map_bot - v.offset_y) / v.scale;
+  expand_bounds_for_viewport(&bmin_x, &bmin_y, &bmax_x, &bmax_y, vx0, vy0, vx1, vy1);
+  MinimapPlot const plot = make_minimap_plot(mm, bmin_x, bmin_y, bmax_x, bmax_y);
+  SDL_SetRenderDrawColorFloat(ren, 0.08f, 0.12f, 0.18f, 0.55f);
+  SDL_FRect plot_bg{plot.x - 1.f, plot.y - 1.f, plot.w + 2.f, plot.h + 2.f};
+  SDL_RenderFillRect(ren, &plot_bg);
 
   auto to_mm = [&](float wx, float wy, float* ox, float* oy) {
-    *ox = inner_x + (wx - v.world_min_x) / world_w * inner_w;
-    *oy = inner_y + (wy - v.world_min_y) / world_h * inner_h;
+    minimap_plot_to_screen(plot, wx, wy, ox, oy);
   };
 
   auto const visited = session.visited_for(cur_seat);
@@ -3718,6 +6372,14 @@ void draw_minimap(SDL_Renderer* ren, GameSession const& session, View const& v, 
     RGB col = terrain_fill(session.terrain_effective_at(c));
     if (!visible.count(c)) {
       col = blend_rgb(col, rgb_u8(64, 64, 64), 0.55f);
+    }
+    if (auto owner = session.claimed_owner_at(c); owner.has_value()) {
+      bool const tint = !minimap_tint_own_claims_only || *owner == cur_seat;
+      if (tint) {
+        RGB const claim = player_rgb(*owner);
+        float const claim_blend = visible.count(c) ? 0.36f : 0.22f;
+        col = blend_rgb(col, claim, claim_blend);
+      }
     }
     SDL_SetRenderDrawColorFloat(ren, col.r, col.g, col.b, 1.f);
     SDL_FRect dot{px - 1.5f, py - 1.5f, 3.f, 3.f};
@@ -3737,10 +6399,45 @@ void draw_minimap(SDL_Renderer* ren, GameSession const& session, View const& v, 
     SDL_RenderFillRect(ren, &sw);
   }
 
-  float const vx0 = (0.f - v.offset_x) / v.scale;
-  float const vy0 = (k_top_bar_h - v.offset_y) / v.scale;
-  float const vx1 = (static_cast<float>(win_w) - v.offset_x) / v.scale;
-  float const vy1 = (static_cast<float>(win_h) - k_footer_bar_h - v.offset_y) / v.scale;
+  for (WildAnimal const& beast : session.wildlife_list()) {
+    if (beast.is_dead() || !visible.count(beast.coord())) {
+      continue;
+    }
+    float px = 0.f;
+    float py = 0.f;
+    to_mm(axial_to_world_x(beast.coord()), axial_to_world_y(beast.coord()), &px, &py);
+    RGB tint = wild_animal_tint(beast.kind());
+    SDL_SetRenderDrawColorFloat(ren, tint.r, tint.g, tint.b, 1.f);
+    SDL_FRect dot{px - 2.f, py - 2.f, 4.f, 4.f};
+    SDL_RenderFillRect(ren, &dot);
+  }
+
+  for (Unit const& u : session.units()) {
+    if (!visited.count(u.coord())) {
+      continue;
+    }
+    bool const own = u.owner_seat() == cur_seat;
+    if (!own && !visible.count(u.coord())) {
+      continue;
+    }
+    float px = 0.f;
+    float py = 0.f;
+    to_mm(axial_to_world_x(u.coord()), axial_to_world_y(u.coord()), &px, &py);
+    RGB pr = player_rgb(u.owner_seat());
+    if (!visible.count(u.coord())) {
+      pr = blend_rgb(pr, rgb_u8(90, 90, 90), 0.45f);
+    }
+    bool const selected = selected_unit_id.has_value() && *selected_unit_id == u.id();
+    if (selected) {
+      SDL_SetRenderDrawColorFloat(ren, 1.f, 1.f, 1.f, 0.95f);
+      SDL_FRect ring{px - 4.f, py - 4.f, 8.f, 8.f};
+      SDL_RenderRect(ren, &ring);
+    }
+    SDL_SetRenderDrawColorFloat(ren, pr.r, pr.g, pr.b, 1.f);
+    SDL_FRect dot{px - 2.f, py - 2.f, 4.f, 4.f};
+    SDL_RenderFillRect(ren, &dot);
+  }
+
   float x0 = 0.f;
   float y0 = 0.f;
   float x1 = 0.f;
@@ -3748,8 +6445,24 @@ void draw_minimap(SDL_Renderer* ren, GameSession const& session, View const& v, 
   to_mm(vx0, vy0, &x0, &y0);
   to_mm(vx1, vy1, &x1, &y1);
   SDL_FRect vp{std::min(x0, x1), std::min(y0, y1), std::abs(x1 - x0), std::abs(y1 - y0)};
+  vp.x = std::max(plot.x, vp.x);
+  vp.y = std::max(plot.y, vp.y);
+  float const vp_right = std::min(plot.x + plot.w, vp.x + vp.w);
+  float const vp_bottom = std::min(plot.y + plot.h, vp.y + vp.h);
+  vp.w = std::max(0.f, vp_right - vp.x);
+  vp.h = std::max(0.f, vp_bottom - vp.y);
+  SDL_SetRenderDrawColorFloat(ren, 1.f, 0.92f, 0.35f, 0.14f);
+  SDL_RenderFillRect(ren, &vp);
   SDL_SetRenderDrawColorFloat(ren, 1.f, 0.92f, 0.35f, 0.95f);
   SDL_RenderRect(ren, &vp);
+
+  for (int i = 0; i < 3; ++i) {
+    float const t = static_cast<float>(i) / 3.f;
+    float const pad = 3.f + t * 5.f;
+    float const a = 0.10f * (1.f - t);
+    menu_ui::stroke_rect(ren, {mm.x + pad, mm.y + pad, mm.w - pad * 2.f, mm.h - pad * 2.f},
+                         menu_ui::k_ink, a);
+  }
 }
 
 void ensure_selection_for_current_seat(GameSession const& session, std::optional<int>* sel_unit,
@@ -3788,12 +6501,19 @@ void touch_camera_for_current_seat(GameSession const& session, GuiState* gui, Vi
 void render_frame(SDL_Renderer* ren, GameSession& session, View const& v, GuiState* gui,
                   std::optional<int> selected_unit_id, std::optional<int> selected_city_id,
                   std::optional<HexCoord> hovered_hex, std::string const& hover_line, int win_w,
-                  int win_h) {
+                  int win_h, float mouse_x, float mouse_y) {
   paint_vertical_background(ren, win_w, win_h);
 
   int const cur_seat = session.current_player().seat;
   auto visible = session.visible_for(cur_seat);
   auto visited = session.visited_for(cur_seat);
+  MapScreen const screen{win_w, win_h};
+  std::optional<HexCoord> selected_unit_hex;
+  if (selected_unit_id.has_value()) {
+    if (auto su = session.unit_by_id(*selected_unit_id); su.has_value()) {
+      selected_unit_hex = su->coord();
+    }
+  }
 
   // --- Tiles ---
   for (HexCoord const c : session.map().all_cells()) {
@@ -3802,15 +6522,9 @@ void render_frame(SDL_Renderer* ren, GameSession& session, View const& v, GuiSta
     float const cy = axial_to_world_y(c);
 
     if (!visited.count(c)) {
-      float sx = 0.f;
-      float sy = 0.f;
-      world_to_screen(v, cx, cy, &sx, &sy);
-      if (sx >= -120.f && sx <= static_cast<float>(win_w) + 120.f && sy >= -120.f &&
-          sy <= static_cast<float>(win_h) + 120.f) {
-        RGB const fog = rgb_u8(0x06, 0x0a, 0x12);
-        fill_hex_solid(ren, v, cx, cy, to_fcolor(fog, 0.94f));
-        stroke_hex_screen(ren, v, cx, cy, 0.12f, 0.15f, 0.20f, 0.42f);
-      }
+      continue;
+    }
+    if (!hex_on_map_screen(v, cx, cy, screen)) {
       continue;
     }
 
@@ -3870,9 +6584,34 @@ void render_frame(SDL_Renderer* ren, GameSession& session, View const& v, GuiSta
         SDL_SetRenderDrawColorFloat(ren, 0.38f, 0.34f, 0.28f, 0.72f);
         SDL_RenderRect(ren, &ore);
       }
+      bool const has_city = session.city_at(c).has_value();
+      if (!has_city && gui != nullptr) {
+        draw_terrain_tile_deco(ren, v, t, c, cx, cy, false);
+      }
+      int const cult = session.cultivation_at(c);
+      if (cult > 0 && imp_here == TileImprovement::NONE) {
+        float sx = 0.f;
+        float sy = 0.f;
+        world_to_screen(v, cx + HEX_R * 0.25f, cy + HEX_R * 0.45f, &sx, &sy);
+        char cult_label[8];
+        std::snprintf(cult_label, sizeof(cult_label), "+%d", cult);
+        menu_ui::draw_text(ren, sx - menu_ui::text_width(cult_label) * 0.5f, sy - 4.f, cult_label,
+                           menu_ui::k_ok, 0.78f);
+      }
+      if (!has_city &&
+          tile_should_show_yield_badge(c, hovered_hex, selected_unit_hex)) {
+        draw_tile_yield_badge(ren, v, session, c, cx, cy);
+      }
     }
   }
 
+  draw_terrain_edge_blends(ren, session, v, visible, visited, screen);
+  draw_coast_foam(ren, session, v, visible, visited, screen);
+  draw_shore_water_depth(ren, session, v, visible, visited, screen);
+  draw_deep_water_overlay(ren, session, v, visible, visited, screen);
+  draw_claim_borders(ren, session, v, visible, visited, screen);
+  draw_weather_tile_overlays(ren, session, v, visited, visible, screen);
+  draw_exploration_frontier_shroud(ren, session, v, visited, screen);
   // --- Legal move / attack overlays ---
   std::unordered_set<HexCoord> moves;
   std::unordered_set<HexCoord> attacks;
@@ -3892,80 +6631,100 @@ void render_frame(SDL_Renderer* ren, GameSession& session, View const& v, GuiSta
   for (HexCoord const c : moves) {
     float const cx = axial_to_world_x(c);
     float const cy = axial_to_world_y(c);
+    if (!hex_on_map_screen(v, cx, cy, screen)) {
+      continue;
+    }
     if (civilian_mode) {
       fill_hex_overlay(ren, v, cx, cy, 110.f / 255.f, 228.f / 255.f, 255.f / 255.f, 108.f / 255.f,
                        25.f / 255.f, 110.f / 255.f, 165.f / 255.f, 72.f / 255.f);
       stroke_hex_screen(ren, v, cx, cy, 170.f / 255.f, 245.f / 255.f, 1.f, 235.f / 255.f);
+      stroke_hex_screen(ren, v, cx, cy, 30.f / 255.f, 140.f / 255.f, 210.f / 255.f, 210.f / 255.f);
+      float sx = 0.f;
+      float sy = 0.f;
+      world_to_screen(v, cx, cy, &sx, &sy);
+      float const d = std::max(7.f, 9.f * v.scale);
+      SDL_SetRenderDrawColorFloat(ren, 248.f / 255.f, 1.f, 1.f, 238.f / 255.f);
+      SDL_FRect dot{sx - d * 0.5f, sy - d * 0.5f, d, d};
+      SDL_RenderFillRect(ren, &dot);
     } else {
       fill_hex_overlay(ren, v, cx, cy, 1.f, 238.f / 255.f, 140.f / 255.f, 118.f / 255.f,
                        190.f / 255.f, 120.f / 255.f, 25.f / 255.f, 68.f / 255.f);
       stroke_hex_screen(ren, v, cx, cy, 1.f, 225.f / 255.f, 140.f / 255.f, 235.f / 255.f);
+      stroke_hex_screen(ren, v, cx, cy, 190.f / 255.f, 120.f / 255.f, 25.f / 255.f, 210.f / 255.f);
     }
   }
   for (HexCoord const c : attacks) {
     float const cx = axial_to_world_x(c);
     float const cy = axial_to_world_y(c);
+    if (!hex_on_map_screen(v, cx, cy, screen)) {
+      continue;
+    }
     fill_hex_overlay(ren, v, cx, cy, 1.f, 120.f / 255.f, 110.f / 255.f, 125.f / 255.f,
                      140.f / 255.f, 25.f / 255.f, 25.f / 255.f, 85.f / 255.f);
     stroke_hex_screen(ren, v, cx, cy, 1.f, 190.f / 255.f, 185.f / 255.f, 228.f / 255.f);
+    stroke_hex_screen(ren, v, cx, cy, 190.f / 255.f, 35.f / 255.f, 35.f / 255.f, 215.f / 255.f);
   }
 
-  // --- Hover outline ---
-  if (hovered_hex.has_value() && session.map().contains(*hovered_hex)) {
-    float const cx = axial_to_world_x(*hovered_hex);
-    float const cy = axial_to_world_y(*hovered_hex);
-    if (visited.count(*hovered_hex)) {
-      stroke_hex_screen(ren, v, cx, cy, 1.f, 1.f, 1.f,
-                        visible.count(*hovered_hex) ? 0.55f : 0.28f);
-    } else {
-      stroke_hex_screen(ren, v, cx, cy, 0.52f, 0.6f, 0.78f, 0.38f);
-    }
-  }
-
-  if (gui != nullptr && gui->move_command_mode && selected_unit_id.has_value()) {
-    auto su = session.unit_by_id(*selected_unit_id);
-    if (su.has_value()) {
-      std::optional<HexCoord> dest = gui->move_cursor;
-      if (!dest.has_value()) {
-        dest = hovered_hex;
-      }
-      if (dest.has_value() && *dest != su->coord() && visited.count(*dest)) {
-        auto path = projected_path_to(session, *su, *dest);
-        if (path.has_value()) {
-          for (HexCoord const c : *path) {
-            if (!visited.count(c)) {
-              continue;
-            }
-            float const cx = axial_to_world_x(c);
-            float const cy = axial_to_world_y(c);
-            stroke_hex_screen(ren, v, cx, cy, 0.35f, 0.95f, 1.f, 0.72f);
-          }
-        }
-      }
-      if (gui->move_cursor.has_value() && visited.count(*gui->move_cursor)) {
-        float const cx = axial_to_world_x(*gui->move_cursor);
-        float const cy = axial_to_world_y(*gui->move_cursor);
-        stroke_hex_screen(ren, v, cx, cy, 1.f, 0.85f, 0.2f, 0.9f);
-      }
-    }
-  }
-
+  std::vector<HexCoord> projected_path;
+  int projected_turns = 0;
   if (selected_unit_id.has_value()) {
     auto su = session.unit_by_id(*selected_unit_id);
     if (su.has_value() && su->owner_seat() == cur_seat) {
       std::vector<HexCoord> const route = session.planned_route_for(*selected_unit_id);
       if (!route.empty()) {
-        for (HexCoord const c : route) {
-          if (!visited.count(c)) {
-            continue;
+        projected_path.push_back(su->coord());
+        projected_path.insert(projected_path.end(), route.begin(), route.end());
+        projected_turns = projected_path_turns(*su, projected_path, session);
+      } else {
+        std::optional<HexCoord> dest;
+        if (gui != nullptr && gui->move_command_mode) {
+          dest = gui->move_cursor;
+          if (!dest.has_value()) {
+            dest = hovered_hex;
           }
-          float const rcx = axial_to_world_x(c);
-          float const rcy = axial_to_world_y(c);
-          stroke_hex_screen(ren, v, rcx, rcy, 0.78f, 0.38f, 0.95f, 0.58f);
+        } else if (hovered_hex.has_value() && su->moves_remaining() > 0 && !session.is_over() &&
+                   !session.current_player().computer) {
+          dest = hovered_hex;
         }
+        if (dest.has_value() && *dest != su->coord()) {
+          if (auto path = projected_path_to(session, *su, *dest);
+              path.has_value() && path->size() >= 2) {
+            projected_path = *path;
+            projected_turns = projected_path_turns(*su, projected_path, session);
+          } else if (moves.count(*dest)) {
+            projected_path = {su->coord(), *dest};
+            projected_turns = 1;
+          }
+        }
+      }
+      if (gui != nullptr && gui->move_command_mode && gui->move_cursor.has_value()) {
+        float const cx = axial_to_world_x(*gui->move_cursor);
+        float const cy = axial_to_world_y(*gui->move_cursor);
+        bool const known = visited.count(*gui->move_cursor);
+        stroke_hex_screen(ren, v, cx, cy, 1.f, 0.85f, 0.2f, known ? 0.9f : 0.35f);
       }
     }
   }
+
+  if (gui != nullptr && selected_unit_id.has_value() && !session.is_over() &&
+      !session.current_player().computer) {
+    if (auto su = session.unit_by_id(*selected_unit_id);
+        su.has_value() && su->kind() == UnitKind::SETTLER && su->owner_seat() == cur_seat &&
+        gui->show_settler_lens) {
+      if (gui->settler_lens_unit_id != *selected_unit_id || gui->settler_lens_seat != cur_seat ||
+          gui->settler_lens_origin != su->coord()) {
+        rebuild_settler_lens_cache(gui, session, cur_seat, *selected_unit_id);
+      }
+      if (!gui->settler_lens_hints.empty()) {
+        draw_settler_lens_markers(ren, v, gui->settler_lens_hints);
+      }
+    } else if (gui->settler_lens_unit_id >= 0) {
+      gui->settler_lens_unit_id = -1;
+      gui->settler_lens_hints.clear();
+    }
+  }
+
+  draw_selected_unit_tile_glow(ren, session, v, selected_unit_id, cur_seat, visible, visited);
 
   // --- Cities ---
   for (City const& ct : session.cities()) {
@@ -3974,6 +6733,12 @@ void render_frame(SDL_Renderer* ren, GameSession& session, View const& v, GuiSta
     }
     float cx = axial_to_world_x(ct.coord());
     float cy = axial_to_world_y(ct.coord());
+    bool const needs_production =
+        ct.owner_seat() == cur_seat && !session.is_over() && !session.current_player().computer &&
+        !ct.current_build().has_value();
+    if (needs_production && visible.count(ct.coord())) {
+      stroke_hex_screen(ren, v, cx, cy, 1.f, 0.78f, 0.22f, 0.80f);
+    }
     RGB base = player_rgb(ct.owner_seat());
     if (!visible.count(ct.coord())) {
       base = blend_rgb(base, rgb_u8(128, 128, 128), 0.5f);
@@ -3981,24 +6746,46 @@ void render_frame(SDL_Renderer* ren, GameSession& session, View const& v, GuiSta
     fill_hex_overlay(ren, v, cx, cy, base.r, base.g, base.b, 0.35f, base.r * 0.6f, base.g * 0.6f,
                      base.b * 0.6f, 0.45f);
     stroke_hex_screen(ren, v, cx, cy, base.r * 0.5f, base.g * 0.5f, base.b * 0.5f, 0.95f);
+    int const pop_tier = city_population_tier(ct.population());
+    if (pop_tier >= 2) {
+      stroke_hex_screen(ren, v, cx, cy, 1.f, 218.f / 255.f, 150.f / 255.f,
+                          pop_tier >= 3 ? 200.f / 255.f : 155.f / 255.f);
+    }
+    if (pop_tier >= 3) {
+      stroke_hex_screen(ren, v, cx, cy, 1.f, 248.f / 255.f, 210.f / 255.f, 175.f / 255.f);
+    }
+    if (v.scale >= k_lod_detail_min_scale) {
+      draw_ground_ellipse_shadow(ren, v, cx, cy, HEX_R * 0.74f, HEX_R * 0.35f, 0.18f);
+    }
     if (selected_city_id.has_value() && *selected_city_id == ct.id()) {
       stroke_hex_screen(ren, v, cx, cy, 1.f, 0.9f, 0.28f, 1.f);
     }
     float hcx = 0;
     float hcy = 0;
     world_to_screen(v, cx, cy, &hcx, &hcy);
-    SDL_SetRenderDrawColorFloat(ren, 1.f, 1.f, 1.f, 0.95f);
     std::string banner = ct.name();
     if (banner.size() > 18) {
       banner.resize(15);
       banner += "...";
     }
-    float const name_half_w = 4.f * static_cast<float>(std::max<std::size_t>(1, banner.size()));
+    float const name_half_w = menu_ui::text_width(banner.c_str()) * 0.5f;
     float const stack_h = k_city_label_name_h + k_city_label_gap + k_city_plate_h;
     float const name_ty = hcy - stack_h * 0.5f;
-    float const plate_ty = name_ty + k_city_label_name_h + k_city_label_gap;
-    SDL_RenderDebugText(ren, hcx - name_half_w, name_ty, banner.c_str());
-    draw_city_population_plate(ren, hcx, plate_ty, ct.population());
+    bool const show_build = ct.current_build().has_value() && visible.count(ct.coord());
+    char build_glyph = show_build ? unit_kind_glyph(*ct.current_build())[0] : '\0';
+    draw_city_map_banner(ren, hcx, name_ty, name_half_w, banner, ct.population(), pop_tier,
+                         show_build, build_glyph);
+  }
+
+  bool hunt_highlight = false;
+  HexCoord hunt_coord{0, 0};
+  if (selected_unit_id.has_value()) {
+    if (auto su = session.unit_by_id(*selected_unit_id);
+        su.has_value() && su->kind() == UnitKind::HUNTING_PARTY &&
+        su->owner_seat() == cur_seat && su->moves_remaining() > 0) {
+      hunt_highlight = session.wild_animal_at(su->coord()).has_value();
+      hunt_coord = su->coord();
+    }
   }
 
   // --- Wildlife ---
@@ -4006,24 +6793,25 @@ void render_frame(SDL_Renderer* ren, GameSession& session, View const& v, GuiSta
     if (beast.is_dead() || !visible.count(beast.coord())) {
       continue;
     }
-    float cx = axial_to_world_x(beast.coord());
-    float cy = axial_to_world_y(beast.coord());
-    float sx = 0;
-    float sy = 0;
-    world_to_screen(v, cx + HEX_R * 0.38f, cy - HEX_R * 0.35f, &sx, &sy);
-    SDL_SetRenderDrawColorFloat(ren, 0.55f, 0.42f, 0.55f, 1.f);
-    SDL_FRect dot{sx - 5.f, sy - 5.f, 10.f, 10.f};
-    SDL_RenderFillRect(ren, &dot);
-    float const hp_frac = static_cast<float>(beast.hp()) /
-                          static_cast<float>(std::max(1, tack::strat::wild_max_hp(beast.kind())));
-    draw_unit_hp_bar(ren, sx, sy - 14.f, 26.f, 4.f, hp_frac);
+    bool const hunt_target = hunt_highlight && beast.coord() == hunt_coord;
+    draw_wild_animal_marker(ren, v, beast, hunt_target);
+  }
+
+  if (selected_unit_id.has_value()) {
+    if (auto su = session.unit_by_id(*selected_unit_id);
+        su.has_value() && su->owner_seat() == cur_seat && visited.count(su->coord())) {
+      draw_unit_ground_selection_ring(ren, v, *su, session);
+    }
   }
 
   // --- Units ---
   for (Unit const& u : session.units()) {
-    if (!visible.count(u.coord())) {
+    bool const in_sight = visible.count(u.coord());
+    bool const own = u.owner_seat() == cur_seat;
+    if (!in_sight && !(own && visited.count(u.coord()))) {
       continue;
     }
+    bool const fog_unit = own && visited.count(u.coord()) && !in_sight;
     float cx = axial_to_world_x(u.coord());
     float cy = axial_to_world_y(u.coord());
     if (session.city_at(u.coord()).has_value()) {
@@ -4037,32 +6825,59 @@ void render_frame(SDL_Renderer* ren, GameSession& session, View const& v, GuiSta
       base = blend_rgb(base, rgb_u8(200, 200, 200), 0.45f);
       rim = blend_rgb(rim, rgb_u8(128, 128, 128), 0.45f);
     }
+    if (fog_unit) {
+      base = blend_rgb(base, rgb_u8(110, 110, 110), 0.50f);
+      rim = blend_rgb(rim, rgb_u8(70, 70, 70), 0.50f);
+    }
 
     float sx = 0;
     float sy = 0;
     float const r = HEX_R * 0.42f * v.scale;
     world_to_screen(v, cx, cy, &sx, &sy);
+    if (v.scale >= k_lod_detail_min_scale && !fog_unit) {
+      draw_ground_ellipse_shadow(ren, v, cx, cy, HEX_R * 0.46f, HEX_R * 0.17f, 0.22f);
+    }
     SDL_FColor rim_c = to_fcolor(rim);
     SDL_FColor base_c = to_fcolor(base);
-    SDL_SetRenderDrawColorFloat(ren, rim_c.r, rim_c.g, rim_c.b, rim_c.a);
+    float const unit_alpha = fog_unit ? 0.62f : 1.f;
+    SDL_SetRenderDrawColorFloat(ren, rim_c.r, rim_c.g, rim_c.b, rim_c.a * unit_alpha);
     SDL_FRect ring_outer{sx - r - 2.5f, sy - r - 2.5f, 2 * r + 5.f, 2 * r + 5.f};
     SDL_RenderFillRect(ren, &ring_outer);
-    SDL_SetRenderDrawColorFloat(ren, base_c.r, base_c.g, base_c.b, base_c.a);
+    SDL_SetRenderDrawColorFloat(ren, base_c.r, base_c.g, base_c.b, base_c.a * unit_alpha);
     SDL_FRect disk{sx - r, sy - r, 2 * r, 2 * r};
     SDL_RenderFillRect(ren, &disk);
-    SDL_SetRenderDrawColorFloat(ren, 1.f, 1.f, 1.f, 105.f / 255.f);
+    SDL_SetRenderDrawColorFloat(ren, 1.f, 1.f, 1.f, (105.f / 255.f) * unit_alpha);
     SDL_FRect sheen{sx - r + 2.f, sy - r + 2.f, 2 * r - 4.f, 2 * r - 4.f};
     SDL_RenderRect(ren, &sheen);
 
-    SDL_SetRenderDrawColorFloat(ren, 1.f, 1.f, 1.f, 1.f);
-    float const bar_w = 2.f * r + 6.f;
-    float const bar_h = 5.f;
-    float const hp_frac =
-        static_cast<float>(u.hp()) / static_cast<float>(std::max(1, u.max_hp()));
-    draw_unit_hp_bar(ren, sx, sy - r - bar_h - 7.f, bar_w, bar_h, hp_frac);
-    char const* const gl = unit_kind_glyph(u.kind());
-    float const gx = std::strlen(gl) > 1 ? sx - 6.f : sx - 3.f;
-    SDL_RenderDebugText(ren, gx, sy - 5.f, gl);
+    draw_unit_kind_glyph_badge(ren, sx, sy, u.kind(), unit_alpha);
+
+    if (u.hp() < u.max_hp()) {
+      float const bar_w = 2.f * r + 6.f;
+      float const bar_h = 4.f;
+      float const hp_frac =
+          static_cast<float>(u.hp()) / static_cast<float>(std::max(1, u.max_hp()));
+      draw_unit_hp_bar(ren, sx, sy + r + 4.f, bar_w, bar_h, hp_frac);
+    }
+
+    if (!session.planned_route_for(u.id()).empty()) {
+      SDL_FRect route_bg{sx + r * 0.45f - 7.f, sy - r * 0.55f - 6.f, 14.f, 12.f};
+      menu_ui::fill_rect(ren, route_bg, rgb_u8(35, 200, 255), 0.90f * unit_alpha);
+      menu_ui::draw_text(ren, route_bg.x + 4.f, route_bg.y + 1.f, ">", menu_ui::k_title, unit_alpha);
+    }
+    if (own && u.sleeping()) {
+      menu_ui::draw_text(ren, sx - r + 2.f, sy - r + 1.f, "Z", menu_ui::k_hint, 0.92f * unit_alpha);
+    } else if (own && u.auto_explore()) {
+      menu_ui::draw_text(ren, sx - r + 2.f, sy - r + 1.f, "E", menu_ui::k_ok, 0.92f * unit_alpha);
+    }
+    if (own && u.carried_food() > 0) {
+      char food_label[8];
+      std::snprintf(food_label, sizeof(food_label), "+%d", u.carried_food());
+      SDL_FRect food_bg{sx + r * 0.35f - 2.f, sy + r * 0.35f, 18.f, 12.f};
+      menu_ui::fill_rect(ren, food_bg, rgb_u8(18, 22, 30), 0.90f * unit_alpha);
+      menu_ui::draw_text(ren, food_bg.x + 2.f, food_bg.y + 1.f, food_label, menu_ui::k_ok,
+                         unit_alpha);
+    }
 
     bool const ring =
         selected_unit_id.has_value() && *selected_unit_id == u.id();
@@ -4071,25 +6886,73 @@ void render_frame(SDL_Renderer* ren, GameSession& session, View const& v, GuiSta
       SDL_FRect sel{sx - r - 5.f, sy - r - 5.f, 2 * r + 10.f, 2 * r + 10.f};
       SDL_RenderRect(ren, &sel);
     }
+    if (gui != nullptr && own && !session.is_over() && !session.current_player().computer) {
+      if (gui->skipped_units.count(u.id())) {
+        menu_ui::draw_text(ren, sx - 4.f, sy - r - 15.f, "S", menu_ui::k_muted, 0.95f);
+      } else if (sdl_unit_needs_manual_orders(session, *gui, u)) {
+        SDL_FRect alert{sx - 5.f, sy - r - 17.f, 10.f, 10.f};
+        menu_ui::fill_rect(ren, alert, rgb_u8(255, 140, 38), 0.95f);
+        menu_ui::draw_text(ren, sx - 2.f, sy - r - 15.f, "!", menu_ui::k_ink, 1.f);
+      }
+    }
+  }
+
+  if (!session.is_over() && !session.current_player().computer) {
+    draw_other_queued_routes(ren, v, session, cur_seat, selected_unit_id);
+  }
+  if (projected_path.size() >= 2) {
+    draw_projected_path(ren, v, projected_path, projected_turns, selected, &session);
+  }
+
+  if (hovered_hex.has_value() && session.map().contains(*hovered_hex)) {
+    float const cx = axial_to_world_x(*hovered_hex);
+    float const cy = axial_to_world_y(*hovered_hex);
+    bool const hover_known = visited.count(*hovered_hex);
+    bool outline_fog_target = false;
+    if (selected_unit_id.has_value()) {
+      if (auto su = session.unit_by_id(*selected_unit_id);
+          su.has_value() && su->owner_seat() == cur_seat) {
+        outline_fog_target = true;
+      }
+    }
+    if (hover_known || outline_fog_target) {
+      draw_hex_hover_highlight(ren, v, cx, cy, hover_known && visible.count(*hovered_hex));
+    }
+  }
+
+  if (gui != nullptr && gui->combat_flash_hex.has_value()) {
+    draw_combat_flash(ren, v, *gui->combat_flash_hex, gui->combat_flash_start_ticks,
+                      gui->combat_flash_until_ticks);
+    if (SDL_GetTicks() >= gui->combat_flash_until_ticks) {
+      gui->combat_flash_hex.reset();
+    }
+  }
+
+  if (!session.is_over()) {
+    draw_time_of_day_overlay(ren, session, win_w, win_h);
+  }
+
+  if (gui != nullptr) {
+    draw_move_command_overlay(ren, *gui, v, session, selected_unit_id, hovered_hex, win_w, win_h);
   }
 
   draw_minimap(ren, session, v, cur_seat, win_w, win_h,
-               play_screen_right_ui_margin(session, selected_city_id));
+               play_screen_right_ui_margin(session, selected_city_id), selected_unit_id,
+               gui != nullptr && gui->minimap_tint_own_claims_only);
   float const max_panel_bottom = play_ui_max_panel_bottom(win_h, gui);
-  draw_top_hud(ren, session, win_w);
+  draw_top_hud(ren, session, gui, win_w);
   if (gui != nullptr) {
-    draw_game_menu_ui(ren, *gui, win_w);
-  }
-  if (gui != nullptr && gui->auto_focus_next_unit && !session.is_over() &&
-      !session.current_player().computer) {
-    menu_ui::draw_text(ren, static_cast<float>(win_w) - 200.f, 34.f, "Auto-cycle ON",
-                       menu_ui::k_ok);
+    draw_game_menu_ui(ren, *gui, session, win_w);
+    draw_play_status_chips(ren, *gui, session, selected_unit_id, win_w);
   }
   UnitInspectorLayout const unit_layout = compute_unit_inspector_layout(
       session, selected_unit_id, cur_seat, win_h, max_panel_bottom);
-  draw_unit_inspector(ren, session, unit_layout, cur_seat);
-  ProductionNeedsLayout const needs_layout = compute_production_needs_layout(
+  ProductionNeedsLayout needs_layout = compute_production_needs_layout(
       session, selected_unit_id, selected_city_id, win_h, max_panel_bottom);
+  stack_production_needs_below_unit(unit_layout, &needs_layout);
+  clamp_panel_max_bottom(max_panel_bottom, &needs_layout.panel);
+  trim_production_needs_buttons(&needs_layout);
+  draw_unit_inspector(ren, session, unit_layout, cur_seat);
   draw_production_needs_panel(ren, session, needs_layout);
   bool const show_production = production_drawer_visible(session, selected_city_id);
   ProductionDrawerLayout const prod_layout =
@@ -4104,37 +6967,74 @@ void render_frame(SDL_Renderer* ren, GameSession& session, View const& v, GuiSta
   draw_city_inspector(ren, session, city_layout, show_production);
   BottomActionBarLayout const action_bar = compute_bottom_action_bar_layout(
       session, *gui, selected_unit_id, selected_city_id, win_w, win_h);
-  draw_bottom_action_bar(ren, action_bar);
   if (gui != nullptr) {
     EventLogLayout const event_log_layout = compute_event_log_layout(*gui, win_w, win_h);
     draw_event_log_panel(ren, event_log_layout, *gui);
+    float const legend_ceiling =
+        event_log_layout.visible ? event_log_layout.panel.y - 6.f
+                                 : static_cast<float>(win_h) - k_footer_bar_h - 8.f;
+    if (gui->show_weather_legend && !session.is_over() && !session.current_player().computer) {
+      draw_weather_legend(ren, win_w, win_h, legend_ceiling);
+    }
+    if (gui->show_claim_legend && !session.is_over() && !session.current_player().computer) {
+      float const left_min_top =
+          left_ui_column_bottom(unit_layout, needs_layout);
+      draw_claim_legend(ren, win_w, legend_ceiling, left_min_top);
+    }
   }
   draw_game_over_overlay(ren, session, win_w, win_h);
   draw_footer_bar(ren, win_w, win_h);
+  bool const orb_hovered =
+      action_bar.visible && screen_point_in_rect(mouse_x, mouse_y, action_bar.action_hit);
+  draw_bottom_action_bar(ren, action_bar, orb_hovered);
 
   float const foot_y = static_cast<float>(win_h) - k_footer_bar_h;
-  SDL_SetRenderDrawColorFloat(ren, 0.95f, 0.97f, 1.f, 1.f);
-  if (action_bar.visible && !action_bar.primary.detail.empty()) {
-    std::string detail = action_bar.primary.detail;
-    if (detail.size() > 72) {
-      detail.resize(69);
-      detail += "...";
-    }
-    SDL_RenderDebugText(ren, 10.f, foot_y + 8.f, detail.c_str());
+  float const hint_max_x = footer_hint_max_x(action_bar, win_w);
+  int const hint_cols = std::max(32, static_cast<int>((hint_max_x - 20.f) / 7.f));
+  if (action_bar.visible && action_bar.action.end_turn_ready) {
+    menu_ui::draw_text(ren, 10.f, foot_y + 8.f,
+                       menu_ui::truncate_line("Ready to end your turn — click the green play button or press Enter",
+                                              hint_cols)
+                           .c_str(),
+                       menu_ui::k_ok);
+  } else if (action_bar.visible && !action_bar.action.detail.empty()) {
+    std::string detail = menu_ui::truncate_line(action_bar.action.detail, hint_cols);
+    menu_ui::draw_text(ren, 10.f, foot_y + 8.f, detail.c_str(), menu_ui::k_hint);
   } else {
-    SDL_RenderDebugText(ren, 10.f, foot_y + 8.f,
-                        "Pan: Shift+drag / middle-drag / arrows  Zoom: wheel or +/-");
+    menu_ui::draw_text(ren, 10.f, foot_y + 8.f,
+                       menu_ui::truncate_line("Pan: Shift+drag / middle-drag / arrows  Zoom: wheel or +/-",
+                                              hint_cols)
+                           .c_str(),
+                       menu_ui::k_hint);
   }
-  SDL_RenderDebugText(ren, 10.f, foot_y + 26.f,
-                      "Primary + End turn (right)  U auto-cycle  Esc menu  F1 help  expand/scroll log");
+  menu_ui::draw_text(
+      ren, 10.f, foot_y + 26.f,
+      menu_ui::truncate_line(
+          "Action button (right) changes by context  P / Enter = same action  F1 help",
+          hint_cols)
+          .c_str(),
+      menu_ui::k_hint);
   if (sdl_player_has_city_without_production(session)) {
-    SDL_RenderDebugText(ren, 10.f, foot_y + 44.f,
-                        "Choose city production in the Build panel (keys 1-6, Shift+click to queue).");
-  } else if (action_bar.visible && !action_bar.end_turn_enabled) {
-    SDL_RenderDebugText(ren, 10.f, foot_y + 44.f, action_bar.end_turn_label.c_str());
+    menu_ui::draw_text(ren, 10.f, foot_y + 44.f,
+                       menu_ui::truncate_line(
+                           "Choose city production in the Build panel (keys 1-6, Shift+click to queue).",
+                           hint_cols)
+                           .c_str(),
+                       menu_ui::k_accent);
+  } else if (action_bar.visible && !action_bar.action.end_turn_ready &&
+             action_bar.action.kind == HudActionKind::NextUnit) {
+    menu_ui::draw_text(ren, 10.f, foot_y + 44.f,
+                       menu_ui::truncate_line("Units still need orders — use the action button to jump to the next",
+                                              hint_cols)
+                           .c_str(),
+                       menu_ui::k_hint);
   } else {
-    SDL_RenderDebugText(ren, 10.f, foot_y + 44.f,
-                        "Hot seat: pass-device screen may appear before the next human plays.");
+    menu_ui::draw_text(ren, 10.f, foot_y + 44.f,
+                       menu_ui::truncate_line(
+                           "Hot seat: pass-device screen may appear before the next human plays.",
+                           hint_cols)
+                           .c_str(),
+                       menu_ui::k_hint);
   }
 
   Uint64 const now = SDL_GetTicks();
@@ -4142,20 +7042,33 @@ void render_frame(SDL_Renderer* ren, GameSession& session, View const& v, GuiSta
     gui->toast_text.clear();
   }
   if (gui != nullptr) {
-    draw_menu_toast(ren, *gui, win_w, win_h);
+    float const toast_max_right =
+        action_bar.visible ? action_bar.action_orb.x - 8.f : 0.f;
+    draw_menu_toast(ren, *gui, win_w, win_h, toast_max_right);
   }
 
-  float hover_tile_y = k_top_bar_h + 10.f;
+  float stack_top_y = left_ui_column_bottom(unit_layout, needs_layout);
   if (gui != nullptr && gui->show_hotkeys) {
-    draw_hotkeys_overlay(ren, win_w, win_h, &hover_tile_y);
+    draw_hotkeys_overlay(ren, win_w, win_h, &stack_top_y);
   }
   if (gui != nullptr && gui->show_intro_tips) {
     draw_intro_tips_overlay(ren, win_w, win_h);
   }
 
-  if (!hover_line.empty()) {
-    draw_tile_hover_text(ren, 10.f, hover_tile_y, hover_line, win_w);
+  EventLogLayout const hover_event_log =
+      gui != nullptr ? compute_event_log_layout(*gui, win_w, win_h) : EventLogLayout{};
+  float const hover_legend_ceiling =
+      hover_event_log.visible ? hover_event_log.panel.y - 6.f
+                              : static_cast<float>(win_h) - k_footer_bar_h - 8.f;
+  bool const show_claim = gui != nullptr && gui->show_claim_legend && !session.is_over() &&
+                          !session.current_player().computer;
+  TileHoverPlacement const hover_place = compute_tile_hover_placement(
+      hover_line, hint_max_x, unit_layout, needs_layout, hover_legend_ceiling, show_claim,
+      stack_top_y);
+  if (hover_place.visible) {
+    draw_tile_hover_text(ren, hover_place.x, hover_place.y, hover_line, hover_place.wrap_w);
   }
+
 }
 
 constexpr char k_gui_camera_json[] = "tack_strat_gui_camera.json";
@@ -4211,6 +7124,18 @@ void center_on_current_player(GameSession const& session, View* v, int win_w, in
     }
   }
   fit_map_to_window(v, win_w, win_h);
+}
+
+void ensure_view_shows_discovered(View* v, GameSession const& session, int seat, int win_w,
+                                  int win_h) {
+  if (view_shows_any_discovered(*v, session, seat, win_w, win_h)) {
+    return;
+  }
+  center_on_current_player(session, v, win_w, win_h);
+  enforce_view_discovered_constraints(v, session, seat, win_w, win_h);
+  if (!view_shows_any_discovered(*v, session, seat, win_w, win_h)) {
+    fit_map_to_window(v, win_w, win_h);
+  }
 }
 
 /** Java {@code HexMapPanel#syncCameraToCurrentPlayer}: stash outgoing seat, restore incoming. */
@@ -4348,9 +7273,12 @@ void on_turn_began_sdl(GameSession& session, GuiState* gui, View* v, std::option
   gui->move_cursor_locked = false;
   gui->skipped_units.clear();
 
+  sync_view_bounds_for_player(v, session, session.current_player().seat);
+
   if (session.current_player().computer) {
     fit_map_to_window(v, win_w, win_h);
     sel_unit->reset();
+    enforce_view_discovered_constraints(v, session, session.current_player().seat, win_w, win_h);
     return;
   }
 
@@ -4359,12 +7287,12 @@ void on_turn_began_sdl(GameSession& session, GuiState* gui, View* v, std::option
     center_on_current_player(session, v, win_w, win_h);
   }
   sel_unit->reset();
-  if (sdl_player_has_city_without_production(session)) {
-    select_first_city_missing_production_sdl(session, v, sel_unit, sel_city, win_w, win_h);
-  } else {
-    pick_default_human_unit(session, sel_unit);
-    if (sel_unit->has_value()) {
-      cycle_next_unit(session, sel_unit, v, win_w, win_h, gui);
+  if (gui->auto_focus_next_unit) {
+    if (sdl_player_has_city_without_production(session)) {
+      select_first_city_missing_production_sdl(session, v, sel_unit, sel_city, win_w, win_h);
+    } else {
+      sel_unit->reset();
+      cycle_next_unit(session, sel_unit, v, win_w, win_h, gui, sel_city);
     }
   }
   if (sel_unit->has_value()) {
@@ -4373,6 +7301,8 @@ void on_turn_began_sdl(GameSession& session, GuiState* gui, View* v, std::option
       keep_hex_visible(v, u->coord(), win_w, win_h);
     }
   }
+  enforce_view_discovered_constraints(v, session, session.current_player().seat, win_w, win_h);
+  ensure_view_shows_discovered(v, session, session.current_player().seat, win_w, win_h);
 
   Player const& cur = session.current_player();
   ensure_event_log_seeded(session, gui);
@@ -4500,17 +7430,94 @@ void draw_modal_card(SDL_Renderer* ren, SDL_FRect r) {
   return s;
 }
 
+[[nodiscard]] std::vector<std::string> wrap_text_to_width(std::string text, float max_width) {
+  std::vector<std::string> lines;
+  if (text.empty()) {
+    return lines;
+  }
+  auto trim_front = [](std::string& s) {
+    while (!s.empty() && s.front() == ' ') {
+      s.erase(s.begin());
+    }
+  };
+  std::size_t pos = 0;
+  while (pos < text.size()) {
+    std::size_t const nl = text.find('\n', pos);
+    std::string paragraph =
+        nl == std::string::npos ? text.substr(pos) : text.substr(pos, nl - pos);
+    pos = nl == std::string::npos ? text.size() : nl + 1;
+    trim_front(paragraph);
+    while (!paragraph.empty()) {
+      if (text_width(paragraph.c_str()) <= max_width) {
+        lines.push_back(paragraph);
+        break;
+      }
+      std::size_t break_at = paragraph.size();
+      while (break_at > 0 && text_width(paragraph.substr(0, break_at).c_str()) > max_width) {
+        std::size_t const sp = paragraph.rfind(' ', break_at - 1);
+        if (sp == std::string::npos || sp < break_at / 4) {
+          break_at = std::max<std::size_t>(1, break_at - 1);
+        } else {
+          break_at = sp;
+        }
+      }
+      if (break_at == 0) {
+        break_at = 1;
+      }
+      lines.push_back(paragraph.substr(0, break_at));
+      paragraph = paragraph.substr(break_at);
+      trim_front(paragraph);
+    }
+  }
+  return lines;
+}
+
 [[nodiscard]] float text_width(char const* text) noexcept {
+  if (g_ui_font != nullptr && text != nullptr && text[0] != '\0') {
+    int w = 0;
+    int h = 0;
+    if (TTF_GetStringSize(g_ui_font, text, 0, &w, &h)) {
+      return static_cast<float>(w);
+    }
+  }
   return static_cast<float>(std::strlen(text)) * 7.15f;
 }
 
 void draw_text(SDL_Renderer* ren, float x, float y, char const* text, RGB c, float a) {
+  if (g_ui_font != nullptr) {
+    int w = 0;
+    int h = 0;
+    if (SDL_Texture* tex = acquire_text_texture(ren, text, c, &w, &h); tex != nullptr) {
+      SDL_SetTextureAlphaModFloat(tex, a);
+      // Debug-font baseline sat ~8px tall at y; nudge the taller TTF glyphs up slightly so
+      // existing y positions still read as the text top.
+      SDL_FRect dst{x, y - 1.f, static_cast<float>(w), static_cast<float>(h)};
+      SDL_RenderTexture(ren, tex, nullptr, &dst);
+      return;
+    }
+  }
   SDL_SetRenderDrawColorFloat(ren, c.r, c.g, c.b, a);
   SDL_RenderDebugText(ren, x, y, text);
 }
 
+void draw_text_wrapped(SDL_Renderer* ren, float x, float y, std::string const& text, float max_w,
+                       float line_h, RGB c, float a) {
+  for (std::string const& line : wrap_text_to_width(text, max_w)) {
+    draw_text(ren, x, y, line.c_str(), c, a);
+    y += line_h;
+  }
+}
+
 void draw_text_centered(SDL_Renderer* ren, float cx, float y, char const* text, RGB c, float a) {
   draw_text(ren, cx - text_width(text) * 0.5f, y, text, c, a);
+}
+
+void draw_text_centered_wrapped(SDL_Renderer* ren, float cx, float y, std::string const& text,
+                                float max_w, float line_h, RGB c, float a) {
+  for (std::string const& line : wrap_text_to_width(text, max_w)) {
+    draw_text_centered(ren, cx, y, line.c_str(), c, a);
+    y += line_h;
+  }
 }
 
 void draw_button(SDL_Renderer* ren, SDL_FRect r, char const* label, RGB fill, RGB border, RGB text,
@@ -4579,7 +7586,7 @@ void draw_button(SDL_Renderer* ren, SDL_FRect r, char const* label, RGB fill, RG
 [[nodiscard]] HandoffLayout compute_handoff_layout(int win_w, int win_h, bool show_retry) {
   HandoffLayout L{};
   L.card.w = std::min(520.f, static_cast<float>(win_w) - 64.f);
-  L.card.h = show_retry ? 372.f : 332.f;
+  L.card.h = show_retry ? 404.f : 364.f;
   L.card.x = (static_cast<float>(win_w) - L.card.w) * 0.5f;
   L.card.y = (static_cast<float>(win_h) - L.card.h) * 0.5f - 16.f;
   L.begin_btn = {L.card.x + (L.card.w - 220.f) * 0.5f, L.card.y + L.card.h - (show_retry ? 98.f : 58.f),
@@ -4711,15 +7718,21 @@ void render_handoff_gate(SDL_Renderer* ren, GameSession const& session, int win_
   title = truncate_line(std::move(title), 52);
   draw_text_centered(ren, cx, L.card.y + 28.f, title.c_str(), k_title);
 
-  float meta_y = L.card.y + 62.f;
-  std::string era = truncate_line(session.calendar_era_label(), 58);
-  draw_text_centered(ren, cx, meta_y, era.c_str(), k_meta);
-  meta_y += 20.f;
+  float meta_y = L.card.y + 58.f;
+  float const text_w = L.card.w - 48.f;
+  for (std::string const& line : wrap_text_to_width(session.calendar_era_label(), text_w)) {
+    draw_text_centered(ren, cx, meta_y, line.c_str(), k_meta);
+    meta_y += 18.f;
+  }
+  meta_y += 4.f;
 
   std::string season_line =
-      std::string(season_label(session.season())) + "  |  " + truncate_line(session.weather_hud_summary(), 42);
-  draw_text_centered(ren, cx, meta_y, season_line.c_str(), k_meta);
-  meta_y += 20.f;
+      std::string(season_label(session.season())) + "  |  " + session.weather_hud_summary();
+  for (std::string const& line : wrap_text_to_width(season_line, text_w)) {
+    draw_text_centered(ren, cx, meta_y, line.c_str(), k_meta);
+    meta_y += 18.f;
+  }
+  meta_y += 8.f;
 
   if (autosave_ok) {
     draw_text_centered(ren, cx, meta_y, "Autosave checkpoint OK", k_ok);
@@ -5261,6 +8274,10 @@ int main(int argc, char** argv) {
     return 1;
   }
   SDL_RaiseWindow(window);
+  // Enable alpha blending so translucent overlays (fog, weather washes, time-of-day
+  // tint, toasts, panels) composite instead of painting opaque.
+  SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+  init_ui_font();
 
   AppPhase phase = menu_launch ? AppPhase::SetupMenu : AppPhase::Playing;
   StartMenuState start_menu{};
@@ -5291,15 +8308,20 @@ int main(int argc, char** argv) {
   load_gui_options(&gui);
   TurnTracker turn_tracker{};
 
+  bool dragging_pan = false;
+  float drag_last_x = 0.f;
+  float drag_last_y = 0.f;
+  float last_mouse_x = static_cast<float>(win_w) * 0.5f;
+  float last_mouse_y = static_cast<float>(win_h) * 0.5f;
+
   if (session && !menu_launch) {
     bootstrap_player_view(*session, &gui, &view, &selected_unit_id, &selected_city_id, win_w, win_h,
                           true);
     drain_cpu_turns(*session);
+    update_map_hover_from_screen(*session, view, last_mouse_x, last_mouse_y,
+                                 session->current_player().seat, selected_unit_id, &gui,
+                                 &hovered_hex, &hover_line);
   }
-
-  bool dragging_pan = false;
-  float drag_last_x = 0.f;
-  float drag_last_y = 0.f;
 
   bool running = true;
   while (running) {
@@ -5382,11 +8404,17 @@ int main(int argc, char** argv) {
       }
       if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
         if (e.button.button == SDL_BUTTON_RIGHT) {
+          bool const had_selection =
+              selected_unit_id.has_value() || selected_city_id.has_value() ||
+              gui.move_command_mode;
           selected_unit_id.reset();
           selected_city_id.reset();
           gui.move_command_mode = false;
           gui.move_cursor.reset();
           gui.move_cursor_locked = false;
+          if (had_selection) {
+            set_toast(&gui, "Selection cleared.", 1600);
+          }
         } else if (e.button.button == SDL_BUTTON_MIDDLE ||
                    (e.button.button == SDL_BUTTON_LEFT &&
                     (SDL_GetModState() & SDL_KMOD_SHIFT))) {
@@ -5404,8 +8432,11 @@ int main(int argc, char** argv) {
               g, selected_unit_id, g.current_player().seat, win_h, max_panel_bottom);
           CityInspectorLayout const city_layout = compute_city_inspector_layout(
               g, selected_city_id, win_w, win_h, show_prod, max_panel_bottom);
-          ProductionNeedsLayout const needs_layout = compute_production_needs_layout(
+          ProductionNeedsLayout needs_layout = compute_production_needs_layout(
               g, selected_unit_id, selected_city_id, win_h, max_panel_bottom);
+          stack_production_needs_below_unit(unit_layout, &needs_layout);
+          clamp_panel_max_bottom(max_panel_bottom, &needs_layout.panel);
+          trim_production_needs_buttons(&needs_layout);
           EventLogLayout const event_log_layout = compute_event_log_layout(gui, win_w, win_h);
           GameMenuLayout const game_menu_layout = compute_game_menu_layout(win_w);
           BottomActionBarLayout const action_bar = compute_bottom_action_bar_layout(
@@ -5441,7 +8472,7 @@ int main(int argc, char** argv) {
             // bottom action bar consumed the click
           } else if (!handle_minimap_click(g, &view, mx, my, win_w, win_h, right_ui)) {
             handle_left_click(g, &view, &gui, selected_unit_id, selected_city_id, mx, my, win_w,
-                              win_h);
+                              win_h, shift_click);
           }
         }
       }
@@ -5451,6 +8482,8 @@ int main(int argc, char** argv) {
         }
       }
       if (e.type == SDL_EVENT_MOUSE_MOTION) {
+        last_mouse_x = e.motion.x;
+        last_mouse_y = e.motion.y;
         if (dragging_pan) {
           float dx = e.motion.x - drag_last_x;
           float dy = e.motion.y - drag_last_y;
@@ -5461,25 +8494,8 @@ int main(int argc, char** argv) {
           clamp_view(&view, win_w, win_h);
           touch_camera_for_current_seat(g, &gui, view);
         }
-        HexCoord const hh = pick_hex_at_screen(g, view, e.motion.x, e.motion.y);
-        if (g.map().contains(hh)) {
-          hovered_hex = hh;
-          int const seat = g.current_player().seat;
-          hover_line = tile_hover_summary(g, hh, seat);
-          if (selected_unit_id.has_value() && !g.is_over() && !g.current_player().computer) {
-            if (auto u = g.unit_by_id(*selected_unit_id);
-                u.has_value() && u->kind() == UnitKind::SETTLER && u->owner_seat() == seat &&
-                !u->is_dead()) {
-              if (std::string preview = sdl_settle_preview_short(g, hh, seat); !preview.empty()) {
-                hover_line += "\n";
-                hover_line += menu_ui::truncate_line(std::move(preview), 92);
-              }
-            }
-          }
-        } else {
-          hovered_hex.reset();
-          hover_line.clear();
-        }
+        update_map_hover_from_screen(g, view, e.motion.x, e.motion.y, g.current_player().seat,
+                                     selected_unit_id, &gui, &hovered_hex, &hover_line);
       }
       if (e.type == SDL_EVENT_MOUSE_WHEEL) {
         float wx = e.wheel.x;
@@ -5618,6 +8634,32 @@ int main(int argc, char** argv) {
 
     if (session && phase == AppPhase::Playing) {
       ensure_selection_for_current_seat(*session, &selected_unit_id, &selected_city_id);
+      if (gui.move_command_mode) {
+        bool stale = !selected_unit_id.has_value();
+        if (!stale) {
+          if (auto u = session->unit_by_id(*selected_unit_id);
+              !u.has_value() || u->owner_seat() != session->current_player().seat) {
+            stale = true;
+          }
+        }
+        if (stale) {
+          clear_move_command_mode(&gui);
+        }
+      }
+      update_map_hover_from_screen(*session, view, last_mouse_x, last_mouse_y,
+                                   session->current_player().seat, selected_unit_id, &gui,
+                                   &hovered_hex, &hover_line);
+      if (gui.move_command_mode && !session->is_over() && !session->current_player().computer) {
+        static Uint64 last_edge_pan_ms = 0;
+        Uint64 const pan_now = SDL_GetTicks();
+        if (pan_now - last_edge_pan_ms >= 32) {
+          maybe_edge_pan_view(&view, last_mouse_x, last_mouse_y, win_w, win_h);
+          last_edge_pan_ms = pan_now;
+        }
+      }
+      enforce_view_discovered_constraints(&view, *session, session->current_player().seat, win_w,
+                                        win_h);
+      ensure_view_shows_discovered(&view, *session, session->current_player().seat, win_w, win_h);
       touch_camera_for_current_seat(*session, &gui, view);
       Uint64 const tick = SDL_GetTicks();
       static Uint64 last_cam_write = 0;
@@ -5637,7 +8679,7 @@ int main(int argc, char** argv) {
       render_victory_screen(renderer, *session, win_w, win_h);
     } else if (session) {
       render_frame(renderer, *session, view, &gui, selected_unit_id, selected_city_id, hovered_hex,
-                   hover_line, win_w, win_h);
+                   hover_line, win_w, win_h, last_mouse_x, last_mouse_y);
     }
     SDL_RenderPresent(renderer);
   }
@@ -5645,6 +8687,7 @@ int main(int argc, char** argv) {
   if (session) {
     save_gui_camera_json(*session, &gui, view);
   }
+  shutdown_ui_font();
   SDL_DestroyRenderer(renderer);
   SDL_DestroyWindow(window);
   SDL_Quit();

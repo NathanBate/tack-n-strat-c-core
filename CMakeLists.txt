@@ -65,19 +65,47 @@ if(TACK_STRAT_BUILD_SDL_GUI)
   set(SDL_SHARED OFF CACHE BOOL "" FORCE)
   set(SDL_STATIC ON CACHE BOOL "" FORCE)
 
+  # Neutralize any stale SDL3_DIR override from earlier configure attempts so OVERRIDE_FIND_PACKAGE
+  # below is what redirects find_package(SDL3) to the in-tree build.
+  unset(SDL3_DIR CACHE)
+
+  # OVERRIDE_FIND_PACKAGE makes SDL3_ttf's find_package(SDL3) resolve to this in-tree build
+  # instead of failing on the static-only generated config / sibling-scope target visibility.
   FetchContent_Declare(
     SDL3
     GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
     GIT_TAG release-3.2.12
     EXCLUDE_FROM_ALL
+    OVERRIDE_FIND_PACKAGE
   )
   FetchContent_MakeAvailable(SDL3)
+
+  # SDL3_ttf for real TrueType text rendering. Vendored FreeType (no HarfBuzz/PlutoSVG
+  # to keep the build light); static link. The release tarball bundles the vendored deps.
+  set(SDLTTF_VENDORED ON CACHE BOOL "" FORCE)
+  set(SDLTTF_HARFBUZZ OFF CACHE BOOL "" FORCE)
+  set(SDLTTF_PLUTOSVG OFF CACHE BOOL "" FORCE)
+  set(SDLTTF_SAMPLES OFF CACHE BOOL "" FORCE)
+  set(SDLTTF_INSTALL OFF CACHE BOOL "" FORCE)
+  set(SDLTTF_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  # SDL3_ttf derives its shared/static choice from BUILD_SHARED_LIBS; force static so it links
+  # against our static SDL3 build.
+  set(BUILD_SHARED_LIBS OFF)
+  FetchContent_Declare(
+    SDL3_ttf
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL_ttf.git
+    GIT_TAG release-3.2.2
+    GIT_SUBMODULES "external/freetype"
+    GIT_SHALLOW TRUE
+    EXCLUDE_FROM_ALL
+  )
+  FetchContent_MakeAvailable(SDL3_ttf)
 
   add_executable(tack_strat_gui
     src/gui/sdl_civ1_main.cpp
   )
   target_link_libraries(tack_strat_gui PRIVATE tack_strat_core SDL3::SDL3-static
-                        nlohmann_json::nlohmann_json)
+                        SDL3_ttf::SDL3_ttf nlohmann_json::nlohmann_json)
 endif()
 
 if(TACK_STRAT_BUILD_BENCH)
